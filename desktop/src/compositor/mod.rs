@@ -50,6 +50,7 @@ pub struct WorkspaceInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositorEvent {
+    WindowOpened,
     WindowClosed {
         address: String,
     },
@@ -101,6 +102,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
         return (
             None,
             VirtualCapabilities {
+                focus_panel: false,
                 supported: false,
                 compositor: name.to_ascii_lowercase(),
                 reason: Some("Virtual panels currently require Hyprland.".into()),
@@ -115,6 +117,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             return (
                 None,
                 VirtualCapabilities {
+                    focus_panel: false,
                     supported: false,
                     compositor: "hyprland".into(),
                     reason: Some(format!("Hyprland IPC socket unavailable: {err:#}")),
@@ -128,6 +131,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
         return (
             None,
             VirtualCapabilities {
+                focus_panel: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(format!("Cannot query Hyprland IPC socket: {err:#}")),
@@ -140,6 +144,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
         return (
             None,
             VirtualCapabilities {
+                focus_panel: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(
@@ -154,6 +159,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
         return (
             None,
             VirtualCapabilities {
+                focus_panel: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(
@@ -167,6 +173,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
     (
         Some(Arc::new(backend)),
         VirtualCapabilities {
+            focus_panel: true,
             supported: true,
             compositor: "hyprland".into(),
             reason: None,

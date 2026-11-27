@@ -94,6 +94,12 @@ pub struct InputState {
 }
 
 impl InputState {
+    pub(crate) fn is_grabbing_overlay(&self, id: OverlayID) -> bool {
+        self.pointers.iter().any(|pointer| {
+            pointer.interaction.grabbed.is_some_and(|grab| grab.grabbed_id == id)
+        })
+    }
+
     pub fn new() -> Self {
         Self {
             hmd: Affine3A::IDENTITY,

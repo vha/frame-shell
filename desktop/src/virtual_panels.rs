@@ -35,6 +35,9 @@ pub enum Command {
     Close {
         surface: u32,
     },
+    Focus {
+        surface: u32,
+    },
     SyncLayout {
         placements: Vec<PanelLayoutTarget>,
     },
@@ -170,17 +173,6 @@ fn pick_primary_physical(monitors: &[MonitorGeometry]) -> Option<&MonitorGeometr
         .iter()
         .filter(|m| !capture::is_virtual_output_name(&m.name))
         .min_by_key(|m| (m.logical_pos != (0, 0), !m.focused, m.id))
-}
-
-fn clamp_even_size(size: [u32; 2]) -> (u32, u32) {
-    let clamp_axis = |v: u32, default: u32, min: u32, max: u32| -> u32 {
-        let v = if v == 0 { default } else { v }.clamp(min, max);
-        (v / 2) * 2
-    };
-    (
-        clamp_axis(size[0], 1920, 640, 3840),
-        clamp_axis(size[1], 1080, 480, 2160),
-    )
 }
 
 fn to_output_geos(monitors: &[MonitorGeometry]) -> Vec<capture::OutputGeometry> {
@@ -324,6 +316,16 @@ impl Worker {
         })
     }
 
+    fn focus_panel(&self, surface: u32) {
+        let (Some(backend), Some(panel)) = (&self.backend, self.panels.get(&surface)) else {
+            return;
+        };
+        self.output.send(&HostMessage::RevealVirtualPanel(surface));
+        if let Err(err) = backend.focus_output(&panel.output_name) {
+            self.output.send(&HostMessage::Error(format!("Could not focus virtual panel: {err:#}")));
+        }
+    }
+
     fn handle_create(&mut self, source: VirtualTargetKind, size: [u32; 2]) {
         let Some(backend) = self.backend.clone() else {
             self.output.send(&HostMessage::Error(
@@ -349,10 +351,7 @@ impl Worker {
             VirtualTargetKind::Workspace { id, .. } => self.workspace_panel(*id),
         };
         if let Some(panel) = existing {
-            self.output.send(&HostMessage::RevealVirtualPanel(panel.surface));
-            if let Err(err) = backend.focus_output(&panel.output_name) {
-                self.output.send(&HostMessage::Error(format!("Could not focus virtual panel: {err:#}")));
-            }
+            self.focus_panel(panel.surface);
             return;
         }
 
@@ -379,7 +378,7 @@ impl Worker {
             }
             _ => size,
         };
-        let (width, height) = clamp_even_size(req_size);
+        let [width, height] = wayvr_ipc::virtual_panel::normalized_size(req_size);
 
         let attempt = (|| -> Result<ActivePanel> {
             let monitors = backend.list_monitors()?;
@@ -798,6 +797,7 @@ impl Worker {
 
     fn handle_event(&mut self, event: CompositorEvent) {
         match event {
+            CompositorEvent::WindowOpened => self.broadcast_targets(),
             CompositorEvent::WindowClosed { address } => {
                 let norm = normalize_window_address(&address);
                 let victim = self.panels.iter().find_map(|(&id, p)| {
@@ -915,6 +915,7 @@ fn run_worker(
             Command::RefreshTargets => worker.broadcast_targets(),
             Command::Create { source, size } => worker.handle_create(source, size),
             Command::Close { surface } => worker.close_panel(surface, true, true),
+            Command::Focus { surface } => worker.focus_panel(surface),
             Command::SyncLayout { placements } => worker.handle_sync_layout(placements),
             Command::Event(ev) => worker.handle_event(ev),
             Command::Shutdown => break,

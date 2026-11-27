@@ -336,6 +336,9 @@ impl Host {
                 self.virtuals
                     .send(virtual_panels::Command::Close { surface });
             }
+            ShellMessage::FocusVirtualPanel { surface } => {
+                self.virtuals.send(virtual_panels::Command::Focus { surface });
+            }
             ShellMessage::SyncPanelLayout { placements } => {
                 self.virtuals
                     .send(virtual_panels::Command::SyncLayout { placements });

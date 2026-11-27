@@ -375,6 +375,7 @@ pub fn parse_socket2_line(line: &str) -> Option<CompositorEvent> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     let (event, data) = trimmed.split_once(">>")?;
     match event {
+        "openwindow" => Some(CompositorEvent::WindowOpened),
         "closewindow" => {
             let address = normalize_window_address(data);
             (!address.is_empty()).then_some(CompositorEvent::WindowClosed { address })
@@ -414,6 +415,10 @@ mod tests {
 
     #[test]
     fn parse_socket2_events() {
+        assert_eq!(
+            parse_socket2_line("openwindow>>56384c00c620,1,editor,Untitled\n"),
+            Some(CompositorEvent::WindowOpened)
+        );
         assert_eq!(
             parse_socket2_line("closewindow>>56384c00c620\n"),
             Some(CompositorEvent::WindowClosed {

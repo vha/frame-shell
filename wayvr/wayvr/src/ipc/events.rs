@@ -85,6 +85,13 @@ where
                     &PacketServer::WlxWindowAttribSetResponse(serial, result),
                 );
             }
+            WayVRSignal::VirtualPanel(connection_id, serial, request) => {
+                let result = crate::frame_shell::panel_controls::handle_request(app, overlays, request);
+                app.ipc_server.send_response(
+                    connection_id,
+                    &PacketServer::VirtualPanelResponse(serial, result),
+                );
+            }
             WayVRSignal::ListOverlays(connection_id, serial, list_params) => {
                 let list = overlays.list_overlays(list_params.visible, list_params.hidden);
                 app.ipc_server.send_response(

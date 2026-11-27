@@ -531,6 +531,9 @@ impl Connection {
             PacketClient::WlxOverlaySetVisible(overlay, visible) => {
                 Self::handle_wlx_overlay_set_visible(params, overlay, visible);
             }
+            PacketClient::VirtualPanel(serial, request) => {
+                params.signals.send(WayVRSignal::VirtualPanel(self.id, serial, request));
+            }
             PacketClient::WlxAppList(serial) => {
                 let apps = crate::frame_shell::app_list_json();
                 self.send(&PacketServer::WlxAppListResponse(serial, apps))?;

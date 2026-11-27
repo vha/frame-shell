@@ -71,6 +71,31 @@ link to Monado's socket (Lepton mounts it as the Android runtime), and `podman`,
 bus and runtime folder when Steam runs in Plasma. `gamescope-0` links to WayVR's socket (KWin's in Plasma), the
 Wayland display Lepton expects.
 
+### PC keyboard controls for virtual panels
+
+Run `wayvrctl virtual-panel pick` in a PC terminal visible in the headset. The picker uses `fzf` for type-to-search,
+arrow keys, Enter and Escape. It offers active panel actions and blank, window and workspace shares, including a
+custom resolution. For example, to open it from Hyprland Lua, bind a free shortcut to your terminal:
+
+```lua
+hl.bind("SUPER + SHIFT + V", hl.dsp.exec_cmd("foot wayvrctl virtual-panel pick"))
+```
+
+The non-interactive commands work without `fzf`. Use the PC source and surface IDs from `list`. For example, on
+PC source 1 with virtual surface 2147483648:
+
+```sh
+wayvrctl --pretty virtual-panel list
+wayvrctl virtual-panel add 1 --size 1600x1000 blank
+wayvrctl virtual-panel nudge 1 2147483648 right --fine
+wayvrctl virtual-panel focus 1 2147483648
+```
+
+`nudge` also accepts `up`, `down`, `left`, `nearer`, `farther`, `larger` and `smaller`. Move and scale commands
+apply to the visible VR panel. With layout sync enabled, the host repositions the virtual output after the existing
+debounce. The list holds the last reported window and workspace targets. Run `wayvrctl virtual-panel refresh 1` if
+you need to refresh them before opening the picker.
+
 ## Several PCs
 
 A PC is identified by its WiVRn server cookie, which its packaged server and `just run` share

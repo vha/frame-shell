@@ -48,6 +48,7 @@ mod desktops;
 mod floor;
 mod keys;
 mod layout_solver;
+pub(crate) mod panel_controls;
 mod pcs;
 mod top_row;
 pub use abi::*;

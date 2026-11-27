@@ -108,6 +108,9 @@ pub enum ShellMessage {
 	CloseVirtualPanel {
 		surface: u32,
 	},
+	FocusVirtualPanel {
+		surface: u32,
+	},
 	SyncPanelLayout {
 		placements: Vec<PanelLayoutTarget>,
 	},
@@ -115,6 +118,8 @@ pub enum ShellMessage {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualCapabilities {
+	#[serde(default)]
+	pub focus_panel: bool,
 	pub supported: bool,
 	pub compositor: String,
 	pub reason: Option<String>,
@@ -316,6 +321,7 @@ mod tests {
 	fn virtual_messages_round_trip() {
 		let state = HostMessage::VirtualState(VirtualState {
 			capabilities: VirtualCapabilities {
+				focus_panel: true,
 				supported: true,
 				compositor: "hyprland".into(),
 				reason: None,

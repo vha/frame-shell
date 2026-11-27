@@ -383,6 +383,20 @@ impl WayVRClient {
 		)
 	}
 
+	pub async fn virtual_panel(
+		client: WayVRClientMutex,
+		serial: Serial,
+		request: crate::virtual_panel::Request,
+	) -> anyhow::Result<crate::virtual_panel::Response> {
+		send_and_wait!(
+			client,
+			serial,
+			&PacketClient::VirtualPanel(serial, request),
+			VirtualPanelResponse
+		)
+		.map_err(anyhow::Error::msg)
+	}
+
 	pub async fn fn_wlx_app_list(client: WayVRClientMutex, serial: Serial) -> anyhow::Result<String> {
 		Ok(send_and_wait!(
 			client,
