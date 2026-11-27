@@ -481,11 +481,14 @@ impl Worker {
                 }
             };
 
+            // Creating a headless output can reset existing custom modes before
+            // the new layout is applied, so pin the pre-creation geometry.
             let pin_updates: Vec<OutputConfigUpdate> = monitors
                 .iter()
                 .map(|m| OutputConfigUpdate {
                     name: m.name.clone(),
-                    mode: None,
+                    mode: capture::is_virtual_output_name(&m.name)
+                        .then_some((m.width, m.height, 60)),
                     pos: Some(m.logical_pos),
                     scale: Some(m.scale),
                 })
@@ -753,9 +756,11 @@ impl Worker {
                 .filter(|b| b.name != panel.output_name)
                 .filter_map(|b| {
                     let after = after_monitors.iter().find(|a| a.name == b.name)?;
-                    (after.logical_pos != b.logical_pos).then(|| OutputConfigUpdate {
+                    let mode_changed = capture::is_virtual_output_name(&b.name)
+                        && (after.width, after.height) != (b.width, b.height);
+                    (mode_changed || after.logical_pos != b.logical_pos).then(|| OutputConfigUpdate {
                         name: b.name.clone(),
-                        mode: None,
+                        mode: mode_changed.then_some((b.width, b.height, 60)),
                         pos: Some(b.logical_pos),
                         scale: Some(b.scale),
                     })
@@ -1057,24 +1062,24 @@ mod tests {
         extern "C" fn on_surface(user: *mut c_void, surface: *const frame_abi::frame_host_surface) {
             let events = unsafe { &*(user as *const Mutex<Events>) };
             let surface = unsafe { &*surface };
-            events.lock().unwrap().surfaces.push(surface.id);
+            lock(events).surfaces.push(surface.id);
         }
         extern "C" fn on_region(_user: *mut c_void, _id: u32, _region: *const f32) {}
         extern "C" fn on_removed(user: *mut c_void, id: u32) {
             let events = unsafe { &*(user as *const Mutex<Events>) };
-            events.lock().unwrap().removed.push(id);
+            lock(events).removed.push(id);
         }
         extern "C" fn on_video(user: *mut c_void, id: u32, _data: *const u8, size: usize) {
             if size > 0 {
                 let events = unsafe { &*(user as *const Mutex<Events>) };
-                events.lock().unwrap().videos.insert(id);
+                lock(events).videos.insert(id);
             }
         }
         extern "C" fn on_message(user: *mut c_void, data: *const u8, size: usize) {
             let slice = unsafe { std::slice::from_raw_parts(data, size) };
             if let Ok(msg) = HostMessage::decode(slice) {
                 let events = unsafe { &*(user as *const Mutex<Events>) };
-                events.lock().unwrap().messages.push(msg);
+                lock(events).messages.push(msg);
             }
         }
 
@@ -1463,6 +1468,81 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
         }
         assert!(revealed, "an existing workspace panel should reopen at the panel limit");
+
+        let (other_panels, other_announcements) = {
+            let events = events_ref.lock().unwrap();
+            let panels = events
+                .messages
+                .iter()
+                .rev()
+                .find_map(|msg| match msg {
+                    HostMessage::VirtualState(state) => Some(&state.panels),
+                    _ => None,
+                })
+                .unwrap();
+            let other_panels: BTreeMap<_, _> = panels
+                .iter()
+                .filter(|p| p.surface != workspace_panel)
+                .map(|p| (p.surface, [p.width, p.height]))
+                .collect();
+            let other_announcements = events
+                .surfaces
+                .iter()
+                .filter(|id| other_panels.contains_key(id))
+                .count();
+            (other_panels, other_announcements)
+        };
+        manager_ref.send(Command::SetSizing {
+            surface: workspace_panel,
+            sizing: wayvr_ipc::virtual_panel::Sizing::Resolution([1600, 900]),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let events = events_ref.lock().unwrap();
+            let panels = events
+                .messages
+                .iter()
+                .rev()
+                .find_map(|msg| match msg {
+                    HostMessage::VirtualState(state) => Some(&state.panels),
+                    _ => None,
+                })
+                .unwrap();
+            if panels
+                .iter()
+                .any(|p| p.surface == workspace_panel && [p.width, p.height] == [1600, 900])
+            {
+                assert_eq!(panels.len(), 3);
+                for p in panels.iter().filter(|p| p.surface != workspace_panel) {
+                    assert_eq!(other_panels[&p.surface], [p.width, p.height]);
+                }
+                assert_eq!(
+                    events
+                        .surfaces
+                        .iter()
+                        .filter(|id| other_panels.contains_key(id))
+                        .count(),
+                    other_announcements
+                );
+                assert!(
+                    events
+                        .removed
+                        .iter()
+                        .all(|id| !other_panels.contains_key(id))
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected to resize one of three streaming panels, actual {panels:?}, errors: {:?}",
+                events.messages.iter().filter_map(|msg| match msg {
+                    HostMessage::Error(err) => Some(err),
+                    _ => None,
+                }).collect::<Vec<_>>()
+            );
+            drop(events);
+            std::thread::sleep(Duration::from_millis(30));
+        }
 
         guard.output.take().unwrap().stop();
         guard.manager.take().unwrap().send(Command::Shutdown);

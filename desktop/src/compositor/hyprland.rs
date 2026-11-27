@@ -256,7 +256,26 @@ impl CompositorBackend for HyprlandBackend {
     }
 
     fn configure_outputs(&self, updates: &[wlr_output::OutputConfigUpdate]) -> Result<()> {
-        wlr_output::apply_output_layout(updates)
+        let mut updates = updates.to_vec();
+        for monitor in self.list_monitors()? {
+            if !crate::capture::is_virtual_output_name(&monitor.name) {
+                continue;
+            }
+            // Hyprland may omit current_mode for a custom headless mode. A full
+            // output transaction must still send that mode to preserve it.
+            let mode = (monitor.width, monitor.height, 60);
+            if let Some(update) = updates.iter_mut().find(|update| update.name == monitor.name) {
+                update.mode.get_or_insert(mode);
+            } else {
+                updates.push(wlr_output::OutputConfigUpdate {
+                    name: monitor.name,
+                    mode: Some(mode),
+                    pos: Some(monitor.logical_pos),
+                    scale: Some(monitor.scale),
+                });
+            }
+        }
+        wlr_output::apply_output_layout(&updates)
     }
 
     fn remove_output(&self, name: &str) -> Result<()> {
