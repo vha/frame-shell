@@ -45,10 +45,14 @@ struct HyprMonitor {
     #[serde(default = "default_scale")]
     scale: f32,
     #[serde(default)]
+    transform: u32,
+    #[serde(default)]
     focused: bool,
     #[serde(default)]
     disabled: bool,
     active_workspace: Option<HyprWorkspaceRef>,
+    #[serde(default)]
+    reserved: [i32; 4],
 }
 
 fn default_scale() -> f32 {
@@ -70,6 +74,16 @@ struct HyprClient {
     initial_class: String,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    at: [i32; 2],
+    #[serde(default)]
+    size: [u32; 2],
+    #[serde(default)]
+    floating: bool,
+    #[serde(default)]
+    fullscreen: u32,
+    #[serde(default)]
+    pinned: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,15 +150,19 @@ impl CompositorBackend for HyprlandBackend {
 
     fn list_monitors(&self) -> Result<Vec<MonitorGeometry>> {
         let json = self.request("j/monitors")?;
-        let raw: Vec<HyprMonitor> =
-            serde_json::from_str(&json).context("Parse j/monitors JSON")?;
+        let raw: Vec<HyprMonitor> = serde_json::from_str(&json).context("Parse j/monitors JSON")?;
         Ok(raw
             .into_iter()
             .filter(|m| !m.disabled)
             .map(|m| {
                 let scale = if m.scale > 0.05 { m.scale } else { 1.0 };
-                let logical_w = ((f32::from(m.width as u16) / scale).round() as i32).max(1);
-                let logical_h = ((f32::from(m.height as u16) / scale).round() as i32).max(1);
+                let (w, h) = if m.transform % 2 == 0 {
+                    (m.width, m.height)
+                } else {
+                    (m.height, m.width)
+                };
+                let logical_w = ((w as f32 / scale).round() as i32).max(1);
+                let logical_h = ((h as f32 / scale).round() as i32).max(1);
                 let (ws_id, ws_name) = m
                     .active_workspace
                     .map_or((0, String::new()), |ws| (ws.id.unwrap_or(0), ws.name));
@@ -156,6 +174,7 @@ impl CompositorBackend for HyprlandBackend {
                     logical_pos: (m.x, m.y),
                     logical_size: (logical_w, logical_h),
                     scale,
+                    reserved: m.reserved,
                     focused: m.focused,
                     active_workspace_id: ws_id,
                     active_workspace_name: ws_name,
@@ -194,6 +213,11 @@ impl CompositorBackend for HyprlandBackend {
                     monitor_name,
                     mapped: c.mapped,
                     hidden: c.hidden,
+                    pos: c.at,
+                    size: c.size,
+                    floating: c.floating,
+                    fullscreen: c.fullscreen != 0,
+                    pinned: c.pinned,
                 }
             })
             .collect())
@@ -241,6 +265,51 @@ impl CompositorBackend for HyprlandBackend {
 
     fn focus_output(&self, name: &str) -> Result<()> {
         self.request_ok(&format_focus_monitor_cmd(self.lua_dispatch, name))
+    }
+
+    fn cursor_position(&self) -> Result<[i32; 2]> {
+        #[derive(Deserialize)]
+        struct Cursor {
+            x: i32,
+            y: i32,
+        }
+        let value = self.request("j/cursorpos")?;
+        let cursor: Cursor =
+            serde_json::from_str(&value).context("Read Hyprland cursor position")?;
+        Ok([cursor.x, cursor.y])
+    }
+
+    fn move_cursor(&self, [x, y]: [i32; 2]) -> Result<()> {
+        let command = if self.lua_dispatch {
+            format!("/dispatch hl.dsp.cursor.move({{ x = {x}, y = {y} }})")
+        } else {
+            format!("/dispatch movecursor {x} {y}")
+        };
+        self.request_ok(&command)
+    }
+
+    fn window_border(&self) -> Result<u32> {
+        #[derive(Deserialize)]
+        struct BorderSize {
+            int: u32,
+        }
+        let value = self.request("j/getoption general:border_size")?;
+        Ok(serde_json::from_str::<BorderSize>(&value)
+            .context("Read Hyprland's border size")?
+            .int)
+    }
+
+    fn move_floating_window(&self, address: &str, [x, y]: [i32; 2]) -> Result<()> {
+        let address = normalize_window_address(address);
+        let command = if self.lua_dispatch {
+            let window = lua_quote(&format!("address:{address}"));
+            format!(
+                "/dispatch hl.dsp.window.move({{ window = {window}, x = {x}, y = {y}, relative = false }})"
+            )
+        } else {
+            format!("/dispatch movewindowpixel exact {x} {y},address:{address}")
+        };
+        self.request_ok(&command)
     }
 
     fn move_window_to_workspace(&self, address: &str, workspace_target: &str) -> Result<()> {

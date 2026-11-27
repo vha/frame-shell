@@ -1026,6 +1026,31 @@ impl<T> OverlayWindowManager<T> {
         None
     }
 
+    pub(crate) fn restore_overlay_transform(&mut self, id: OverlayID, transform: Affine3A) {
+        let Some(overlay) = self.overlays.get_mut(id) else {
+            return;
+        };
+        if let Some(state) = &mut overlay.config.active_state {
+            state.transform = transform;
+            overlay.config.dirty = true;
+            return;
+        }
+        let name = overlay.config.name.clone();
+        let set = if overlay.config.global {
+            &mut self.global_set
+        } else {
+            &mut self.sets[self.restore_set]
+        };
+        if let Some(state) = set.overlays.get_mut(id) {
+            state.transform = transform;
+        }
+        for states in [&mut set.hidden_overlays, &mut set.inactive_overlays] {
+            if let Some((_, state)) = states.iter_mut().find(|(key, _)| key == &name) {
+                state.transform = transform;
+            }
+        }
+    }
+
     pub fn add(&mut self, overlay: OverlayWindowData<T>, app: &mut AppState) -> OverlayID {
         self.add_with_spawn_pos(overlay, app, SpawnPos::Fixed)
     }
@@ -1275,6 +1300,7 @@ impl<T> OverlayWindowManager<T> {
         if new_set == self.current_set || new_set.is_some_and(|x| x >= self.sets.len()) {
             return;
         }
+        crate::frame_shell::drag_edit::cancel(app, self);
 
         if let Some(current_set) = self.current_set.as_ref() {
             let ws = &mut self.sets[*current_set];

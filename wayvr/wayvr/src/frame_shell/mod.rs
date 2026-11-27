@@ -45,6 +45,7 @@ use wlx_common::{
 
 mod abi;
 mod desktops;
+pub(crate) mod drag_edit;
 mod floor;
 mod keys;
 mod layout_solver;

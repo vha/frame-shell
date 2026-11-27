@@ -1,5 +1,7 @@
 //! Virtual headless panel lifecycle manager for interactive VR desktop panels.
 
+mod sizing;
+
 use crate::{
     Output, Shared, capture,
     compositor::{
@@ -38,8 +40,13 @@ pub enum Command {
     Focus {
         surface: u32,
     },
+    SetSizing {
+        surface: u32,
+        sizing: wayvr_ipc::virtual_panel::Sizing,
+    },
     SyncLayout {
         placements: Vec<PanelLayoutTarget>,
+        logical_sizes: Vec<(u32, [i32; 2])>,
     },
     Event(CompositorEvent),
     Shutdown,
@@ -77,6 +84,7 @@ struct ActivePanel {
     ownership: PanelOwnership,
     cancel: Arc<AtomicBool>,
     capture_thread: Option<JoinHandle<()>>,
+    fit: Option<sizing::FitWindow>,
 }
 
 impl ActivePanel {
@@ -90,6 +98,8 @@ impl ActivePanel {
             logical_pos: self.logical_pos,
             logical_size: self.logical_size,
             scale: self.scale,
+            fit_to_window: self.fit.as_ref().map(|fit| fit.enabled),
+            fit_status: self.fit.as_ref().and_then(|fit| fit.status.clone()),
         }
     }
 }
@@ -194,6 +204,8 @@ struct Worker {
     shared: Arc<Shared>,
     panels: BTreeMap<u32, ActivePanel>,
     next_slot: u32,
+    next_fit_poll: std::time::Instant,
+    next_resize_serial: u64,
 }
 
 impl Worker {
@@ -564,28 +576,9 @@ impl Worker {
 
             self.shared.register_stream(surface, output_name.clone());
             let cancel = Arc::new(AtomicBool::new(false));
-            let cancel_thread = cancel.clone();
-            let output_thread = self.output.clone();
-            let shared_thread = self.shared.clone();
-            let name_thread = output_name.clone();
-            let capture_thread = std::thread::Builder::new()
-                .name(format!("vcap-{}", output_name))
-                .spawn(move || {
-                    if let Err(err) = wayland_capture::stream_virtual_output(
-                        surface,
-                        &name_thread,
-                        &cancel_thread,
-                        &output_thread,
-                        &shared_thread,
-                    ) {
-                        eprintln!("Virtual capture {name_thread} failed: {err:#}");
-                        output_thread.send(&HostMessage::Error(format!(
-                            "Virtual panel {name_thread} capture stopped: {err:#}"
-                        )));
-                    }
-                    shared_thread.unregister_stream(surface);
-                    output_thread.removed(surface);
-                })?;
+            let capture_thread = self.start_capture(surface, &output_name, cancel.clone())?;
+            let fit =
+                matches!(ownership, PanelOwnership::Window { .. }).then(sizing::FitWindow::default);
 
             Ok(ActivePanel {
                 surface,
@@ -599,6 +592,7 @@ impl Worker {
                 ownership,
                 cancel,
                 capture_thread: Some(capture_thread),
+                fit,
             })
         })();
 
@@ -614,15 +608,52 @@ impl Worker {
             }
             Err(err) => {
                 eprintln!("Failed to create virtual panel: {err:#}");
-                self.output
-                    .send(&HostMessage::Error(format!("Virtual panel failed: {err:#}")));
+                self.output.send(&HostMessage::Error(format!(
+                    "Virtual panel failed: {err:#}"
+                )));
                 self.broadcast_state();
                 self.broadcast_targets();
             }
         }
     }
 
-    fn evacuate_output(&self, backend: &dyn CompositorBackend, panel: &ActivePanel, restore_owned: bool) {
+    fn start_capture(
+        &self,
+        surface: u32,
+        name: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<JoinHandle<()>> {
+        let output = self.output.clone();
+        let shared = self.shared.clone();
+        let name = name.to_owned();
+        Ok(std::thread::Builder::new()
+            .name(format!("vcap-{name}"))
+            .spawn(move || {
+                if let Err(err) = wayland_capture::stream_virtual_output(
+                    surface, &name, &cancel, &output, &shared,
+                ) {
+                    eprintln!("Virtual capture {name} failed: {err:#}");
+                    if !crate::lock(&shared.resizing_virtual_outputs).contains(&surface) {
+                        output.send(&HostMessage::Error(format!(
+                            "Virtual panel {name} capture stopped: {err:#}"
+                        )));
+                    }
+                }
+                crate::lock(&shared.virtual_keyframe_sizes).remove(&surface);
+                // A sizing transaction restores and restarts this worker on failure.
+                if !crate::lock(&shared.resizing_virtual_outputs).contains(&surface) {
+                    shared.unregister_stream(surface);
+                    output.removed(surface);
+                }
+            })?)
+    }
+
+    fn evacuate_output(
+        &self,
+        backend: &dyn CompositorBackend,
+        panel: &ActivePanel,
+        restore_owned: bool,
+    ) {
         let Ok(monitors) = backend.list_monitors() else {
             return;
         };
@@ -649,9 +680,9 @@ impl Worker {
                 ..
             } => {
                 let target_ws = if restore_owned {
-                    let return_mon_exists = monitors
-                        .iter()
-                        .any(|m| !capture::is_virtual_output_name(&m.name) && m.name == *return_monitor);
+                    let return_mon_exists = monitors.iter().any(|m| {
+                        !capture::is_virtual_output_name(&m.name) && m.name == *return_monitor
+                    });
                     if return_mon_exists {
                         *return_workspace_id
                     } else {
@@ -677,7 +708,9 @@ impl Worker {
             } => {
                 let target_monitor = monitors
                     .iter()
-                    .find(|m| !capture::is_virtual_output_name(&m.name) && m.name == *return_monitor)
+                    .find(|m| {
+                        !capture::is_virtual_output_name(&m.name) && m.name == *return_monitor
+                    })
                     .map_or(fallback.name.as_str(), |m| m.name.as_str());
                 let ws_exists = backend
                     .list_workspaces()
@@ -708,6 +741,7 @@ impl Worker {
         self.shared.unregister_stream(surface);
         crate::lock(&self.shared.visibility).remove(&surface);
         crate::lock(&self.shared.keyframes).remove(&surface);
+        crate::lock(&self.shared.virtual_keyframe_sizes).remove(&surface);
 
         if let Some(backend) = self.backend.as_ref() {
             let before_monitors = backend.list_monitors().unwrap_or_default();
@@ -743,10 +777,21 @@ impl Worker {
         }
     }
 
-    fn handle_sync_layout(&mut self, placements: Vec<PanelLayoutTarget>) {
+    fn handle_sync_layout(
+        &mut self,
+        placements: Vec<PanelLayoutTarget>,
+        logical_sizes: Vec<(u32, [i32; 2])>,
+    ) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        if logical_sizes.iter().any(|(surface, size)| {
+            self.panels
+                .get(surface)
+                .is_none_or(|p| p.logical_size != *size)
+        }) {
+            return;
+        }
         let mut updates = Vec::new();
         for target in &placements {
             if let Some(panel) = self.panels.get(&target.surface)
@@ -763,20 +808,30 @@ impl Worker {
         if updates.is_empty() {
             return;
         }
+        let cursor = backend.cursor_position().ok().and_then(|pointer| {
+            let monitors = backend.list_monitors().ok()?;
+            let old = monitors.into_iter().find(|monitor| {
+                monitor.contains(pointer) && updates.iter().any(|u| u.name == monitor.name)
+            })?;
+            Some((pointer, old))
+        });
         match backend.configure_outputs(&updates) {
             Ok(()) => {
                 if let Ok(monitors) = backend.list_monitors() {
                     self.shared
                         .update_outputs(&self.output, to_output_geos(&monitors));
-                    for panel in self.panels.values_mut() {
-                        if let Some(mon) = monitors.iter().find(|m| m.name == panel.output_name) {
-                            panel.width = mon.width;
-                            panel.height = mon.height;
-                            panel.logical_pos = [mon.logical_pos.0, mon.logical_pos.1];
-                            panel.logical_size = [mon.logical_size.0, mon.logical_size.1];
-                            panel.scale = mon.scale;
-                        }
+                    if let Some((pointer, old)) = cursor
+                        && let Some(new) = monitors.iter().find(|m| m.name == old.name)
+                    {
+                        preserve_cursor(
+                            backend.as_ref(),
+                            new,
+                            pointer,
+                            [old.logical_pos.0, old.logical_pos.1],
+                            [new.logical_pos.0, new.logical_pos.1],
+                        );
                     }
+                    self.refresh_panel_geometries(&monitors);
                 } else {
                     for target in &placements {
                         if let Some(panel) = self.panels.get_mut(&target.surface) {
@@ -860,6 +915,22 @@ impl Worker {
     }
 }
 
+fn preserve_cursor(
+    backend: &dyn CompositorBackend,
+    monitor: &MonitorGeometry,
+    pointer: [i32; 2],
+    from: [i32; 2],
+    to: [i32; 2],
+) {
+    let target = std::array::from_fn(|i| pointer[i] - from[i] + to[i]);
+    if target != pointer
+        && monitor.contains(target)
+        && backend.cursor_position().ok() == Some(pointer)
+    {
+        let _ = backend.move_cursor(target);
+    }
+}
+
 fn run_worker(
     backend: Option<Arc<dyn CompositorBackend>>,
     capabilities: VirtualCapabilities,
@@ -900,10 +971,22 @@ fn run_worker(
         shared,
         panels: BTreeMap::new(),
         next_slot: 0,
+        next_fit_poll: std::time::Instant::now(),
+        next_resize_serial: 1,
     };
     worker.broadcast_state();
 
-    while let Ok(cmd) = rx.recv() {
+    let mut next_command = None;
+    loop {
+        worker.poll_window_fit();
+        let cmd = match next_command
+            .take()
+            .map_or_else(|| rx.recv_timeout(worker.fit_poll_delay()), Ok)
+        {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) if !worker.output.stopped() => continue,
+            Err(_) => break,
+        };
         if worker.output.stopped() && !matches!(cmd, Command::Shutdown) {
             break;
         }
@@ -916,7 +999,28 @@ fn run_worker(
             Command::Create { source, size } => worker.handle_create(source, size),
             Command::Close { surface } => worker.close_panel(surface, true, true),
             Command::Focus { surface } => worker.focus_panel(surface),
-            Command::SyncLayout { placements } => worker.handle_sync_layout(placements),
+            Command::SetSizing {
+                surface,
+                mut sizing,
+            } => {
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        Command::SetSizing {
+                            surface: next,
+                            sizing: newer,
+                        } if next == surface => sizing = newer,
+                        other => {
+                            next_command = Some(other);
+                            break;
+                        }
+                    }
+                }
+                worker.set_sizing(surface, sizing);
+            }
+            Command::SyncLayout {
+                placements,
+                logical_sizes,
+            } => worker.handle_sync_layout(placements, logical_sizes),
             Command::Event(ev) => worker.handle_event(ev),
             Command::Shutdown => break,
         }
@@ -934,9 +1038,10 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeSet, ffi::c_void};
+    use crate::lock;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+    use std::{collections::BTreeSet, ffi::c_void};
 
     #[ignore = "requires a running Hyprland desktop session and GStreamer hardware encoder"]
     #[test]
@@ -1066,6 +1171,7 @@ mod tests {
         let surface_id = created_surface.expect("virtual panel created and streamed");
 
         manager_ref.send(Command::SyncLayout {
+            logical_sizes: vec![(surface_id, [1280, 720])],
             placements: vec![PanelLayoutTarget {
                 surface: surface_id,
                 x: 0,
@@ -1090,7 +1196,86 @@ mod tests {
             drop(guard);
             std::thread::sleep(Duration::from_millis(30));
         }
-        assert!(moved, "expected SyncLayout to reposition FRAME-V1 to (0, -720)");
+        assert!(
+            moved,
+            "expected SyncLayout to reposition FRAME-V1 to (0, -720)"
+        );
+
+        shared.virtual_resize_ack.store(true, Ordering::Release);
+        manager_ref.send(Command::SetSizing {
+            surface: surface_id,
+            sizing: wayvr_ipc::virtual_panel::Sizing::Resolution([1600, 900]),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let resized = loop {
+            let events = events_ref.lock().unwrap();
+            if lock(&shared.virtual_keyframe_sizes).get(&surface_id) == Some(&(1600, 900))
+                && let Some(serial) = events.messages.iter().find_map(|msg| match msg {
+                    HostMessage::VerifyVirtualResize {
+                        surface,
+                        size: [1600, 900],
+                        serial,
+                    } if *surface == surface_id => Some(*serial),
+                    _ => None,
+                })
+            {
+                *lock(&shared.decoded_virtual_resize) = Some((surface_id, serial));
+            }
+            let panel = events.messages.iter().rev().find_map(|msg| match msg {
+                HostMessage::VirtualState(state) => state.panels.first(),
+                _ => None,
+            });
+            if panel.is_some_and(|p| {
+                p.surface == surface_id
+                    && [p.width, p.height] == [1600, 900]
+                    && p.logical_pos == [0, -900]
+            }) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                for error in events.messages.iter().filter_map(|msg| match msg {
+                    HostMessage::Error(error) => Some(error),
+                    _ => None,
+                }) {
+                    eprintln!("{error}");
+                }
+                break false;
+            }
+            drop(events);
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        assert!(
+            resized,
+            "expected a new keyframe and the same panel at (0, -900)"
+        );
+
+        manager_ref.send(Command::SetSizing {
+            surface: surface_id,
+            sizing: wayvr_ipc::virtual_panel::Sizing::Resolution([900, 1200]),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let events = events_ref.lock().unwrap();
+            if events.messages.iter().any(|msg| {
+                matches!(msg,
+                    HostMessage::Error(error) if error.contains("Restored the previous resolution")
+                )
+            }) && lock(&shared.virtual_keyframe_sizes).get(&surface_id) == Some(&(1600, 900))
+            {
+                let monitors = backend.list_monitors().unwrap();
+                let output = monitors.iter().find(|m| m.name == "FRAME-V1").unwrap();
+                assert_eq!([output.width, output.height], [1600, 900]);
+                assert_eq!(output.logical_pos, (0, -900));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected rollback after missing decode acknowledgement"
+            );
+            drop(events);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        shared.virtual_resize_ack.store(false, Ordering::Release);
 
         manager_ref.send(Command::Close {
             surface: surface_id,
@@ -1117,10 +1302,129 @@ mod tests {
         }
         assert!(closed, "expected virtual panel close and removal");
 
+        if std::env::var_os("FRAME_TEST_WINDOW_FIT").is_some() {
+            let output = std::process::Command::new("alacritty")
+                .args([
+                    "--class",
+                    "frame-fit-test",
+                    "--config-file",
+                    "/dev/null",
+                    "-e",
+                    "sleep",
+                    "30",
+                ])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("Alacritty test window");
+            struct TestWindow(std::process::Child);
+            impl Drop for TestWindow {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let _window = TestWindow(output);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let window = loop {
+                if let Some(window) = backend
+                    .list_windows()
+                    .unwrap()
+                    .into_iter()
+                    .find(|w| w.app_id == "frame-fit-test")
+                {
+                    break window;
+                }
+                assert!(Instant::now() < deadline, "test window never mapped");
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            manager_ref.send(Command::Create {
+                source: VirtualTargetKind::Window {
+                    address: window.address.clone(),
+                    title: window.title,
+                    app_id: window.app_id,
+                },
+                size: [1280, 720],
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let panel = loop {
+                let events = events_ref.lock().unwrap();
+                if let Some(panel) = events
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|msg| match msg {
+                        HostMessage::VirtualState(state) => state.panels.first().cloned(),
+                        _ => None,
+                    })
+                    .filter(|p| p.surface != surface_id && events.videos.contains(&p.surface))
+                {
+                    break panel;
+                }
+                assert!(Instant::now() < deadline, "window panel never streamed");
+                drop(events);
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            assert_eq!(panel.fit_to_window, Some(true));
+            let address = window.address;
+            for cmd in [
+                format!("hl.dsp.window.float({{ window = 'address:{address}', action = 'set' }})"),
+                format!(
+                    "hl.dsp.window.resize({{ window = 'address:{address}', x = 906, y = 604, relative = false }})"
+                ),
+            ] {
+                let output = std::process::Command::new("hyprctl")
+                    .args(["dispatch", &cmd])
+                    .output()
+                    .unwrap();
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+            }
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                let events = events_ref.lock().unwrap();
+                let latest = events.messages.iter().rev().find_map(|msg| match msg {
+                    HostMessage::VirtualState(state) => {
+                        state.panels.iter().find(|p| p.surface == panel.surface)
+                    }
+                    _ => None,
+                });
+                if let Some(p) = latest.filter(|p| p.fit_status.is_none() && p.width != 1280) {
+                    let app = backend
+                        .list_windows()
+                        .unwrap()
+                        .into_iter()
+                        .find(|w| w.address == address)
+                        .unwrap();
+                    let border = backend.window_border().unwrap();
+                    assert_eq!(
+                        [p.width, p.height],
+                        app.size.map(|size| (size + 2 * border + 1) & !1)
+                    );
+                    assert_eq!(app.pos, p.logical_pos.map(|axis| axis + border as i32));
+                    assert!(events.videos.contains(&p.surface));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "window fit did not settle: {latest:?}"
+                );
+                drop(events);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            manager_ref.send(Command::Close {
+                surface: panel.surface,
+            });
+        }
+
         for target in [
             source.clone(),
-            VirtualTargetKind::Blank { width: 1280, height: 720 },
-            VirtualTargetKind::Blank { width: 1280, height: 720 },
+            VirtualTargetKind::Blank {
+                width: 1280,
+                height: 720,
+            },
+            VirtualTargetKind::Blank {
+                width: 1280,
+                height: 720,
+            },
         ] {
             manager_ref.send(Command::Create {
                 source: target,

@@ -1061,6 +1061,9 @@ where
 
 fn start_grab(par: StartGrabParams) {
     let (app, id, state) = (par.app, par.id, par.state);
+    if app.panel_drag.is_some() {
+        return;
+    }
 
     let pointer = &mut app.input_state.pointers[par.idx];
 

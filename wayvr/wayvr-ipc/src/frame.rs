@@ -50,6 +50,11 @@ pub enum HostMessage {
 	VirtualTargets(VirtualTargets),
 	/// Reveal the existing panel when its target is selected again.
 	RevealVirtualPanel(u32),
+	VerifyVirtualResize {
+		surface: u32,
+		size: [u32; 2],
+		serial: u64,
+	},
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -111,8 +116,19 @@ pub enum ShellMessage {
 	FocusVirtualPanel {
 		surface: u32,
 	},
+	SetVirtualPanelSizing {
+		surface: u32,
+		sizing: crate::virtual_panel::Sizing,
+	},
 	SyncPanelLayout {
 		placements: Vec<PanelLayoutTarget>,
+		#[serde(default)]
+		logical_sizes: Vec<(u32, [i32; 2])>,
+	},
+	EnableVirtualResizeAck,
+	VirtualResizeDecoded {
+		surface: u32,
+		serial: u64,
 	},
 }
 
@@ -120,6 +136,8 @@ pub enum ShellMessage {
 pub struct VirtualCapabilities {
 	#[serde(default)]
 	pub focus_panel: bool,
+	#[serde(default)]
+	pub resize_panel: bool,
 	pub supported: bool,
 	pub compositor: String,
 	pub reason: Option<String>,
@@ -164,6 +182,11 @@ pub struct VirtualPanelInfo {
 	pub logical_pos: [i32; 2],
 	pub logical_size: [i32; 2],
 	pub scale: f32,
+	/// Present on window panels. True when automatic fitting is enabled.
+	#[serde(default)]
+	pub fit_to_window: Option<bool>,
+	#[serde(default)]
+	pub fit_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +345,7 @@ mod tests {
 		let state = HostMessage::VirtualState(VirtualState {
 			capabilities: VirtualCapabilities {
 				focus_panel: true,
+				resize_panel: true,
 				supported: true,
 				compositor: "hyprland".into(),
 				reason: None,
@@ -336,6 +360,8 @@ mod tests {
 				logical_pos: [0, -1080],
 				logical_size: [1920, 1080],
 				scale: 1.0,
+				fit_to_window: None,
+				fit_status: None,
 			}],
 			physical_monitors: vec![PhysicalMonitorInfo {
 				surface: Some(0),
@@ -401,6 +427,7 @@ mod tests {
 				surface: VIRTUAL_SURFACE_BASE,
 			},
 			ShellMessage::SyncPanelLayout {
+				logical_sizes: vec![(VIRTUAL_SURFACE_BASE, [1920, 1080])],
 				placements: vec![PanelLayoutTarget {
 					surface: VIRTUAL_SURFACE_BASE,
 					x: 320,

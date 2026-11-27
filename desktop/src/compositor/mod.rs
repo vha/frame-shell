@@ -22,9 +22,18 @@ pub struct MonitorGeometry {
     pub logical_pos: (i32, i32),
     pub logical_size: (i32, i32),
     pub scale: f32,
+    /// Reserved logical space on the left, top, right and bottom.
+    pub reserved: [i32; 4],
     pub focused: bool,
     pub active_workspace_id: i32,
     pub active_workspace_name: String,
+}
+
+impl MonitorGeometry {
+    pub fn contains(&self, [x, y]: [i32; 2]) -> bool {
+        let (left, top) = self.logical_pos;
+        x >= left && x < left + self.logical_size.0 && y >= top && y < top + self.logical_size.1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +47,11 @@ pub struct WindowInfo {
     pub monitor_name: String,
     pub mapped: bool,
     pub hidden: bool,
+    pub pos: [i32; 2],
+    pub size: [u32; 2],
+    pub floating: bool,
+    pub fullscreen: bool,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +94,10 @@ pub trait CompositorBackend: Send + Sync {
     fn configure_outputs(&self, updates: &[wlr_output::OutputConfigUpdate]) -> Result<()>;
     fn remove_output(&self, name: &str) -> Result<()>;
     fn focus_output(&self, name: &str) -> Result<()>;
+    fn cursor_position(&self) -> Result<[i32; 2]>;
+    fn move_cursor(&self, position: [i32; 2]) -> Result<()>;
+    fn move_floating_window(&self, address: &str, position: [i32; 2]) -> Result<()>;
+    fn window_border(&self) -> Result<u32>;
     fn move_window_to_workspace(&self, address: &str, workspace_target: &str) -> Result<()>;
     fn move_workspace_to_output(&self, workspace_id: i32, output: &str) -> Result<()>;
     fn subscribe_events(&self, tx: Sender<CompositorEvent>, stop: Arc<AtomicBool>) -> Result<()>;
@@ -103,6 +121,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             None,
             VirtualCapabilities {
                 focus_panel: false,
+                resize_panel: false,
                 supported: false,
                 compositor: name.to_ascii_lowercase(),
                 reason: Some("Virtual panels currently require Hyprland.".into()),
@@ -118,6 +137,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
                 None,
                 VirtualCapabilities {
                     focus_panel: false,
+                    resize_panel: false,
                     supported: false,
                     compositor: "hyprland".into(),
                     reason: Some(format!("Hyprland IPC socket unavailable: {err:#}")),
@@ -132,6 +152,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             None,
             VirtualCapabilities {
                 focus_panel: false,
+                resize_panel: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(format!("Cannot query Hyprland IPC socket: {err:#}")),
@@ -145,6 +166,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             None,
             VirtualCapabilities {
                 focus_panel: false,
+                resize_panel: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(
@@ -160,6 +182,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             None,
             VirtualCapabilities {
                 focus_panel: false,
+                resize_panel: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(
@@ -174,6 +197,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
         Some(Arc::new(backend)),
         VirtualCapabilities {
             focus_panel: true,
+            resize_panel: true,
             supported: true,
             compositor: "hyprland".into(),
             reason: None,

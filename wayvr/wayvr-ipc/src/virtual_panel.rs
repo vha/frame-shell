@@ -38,6 +38,20 @@ pub enum Request {
 		target: Target,
 		size: [u32; 2],
 	},
+	BeginDrag {
+		source: u32,
+		surface: u32,
+	},
+	BeginDragAtOutput {
+		output: String,
+	},
+	DragMotion {
+		translation: [f32; 3],
+		scale_steps: f32,
+	},
+	EndDrag {
+		commit: bool,
+	},
 	Control {
 		source: u32,
 		surface: u32,
@@ -53,6 +67,12 @@ pub enum Target {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Sizing {
+	Resolution([u32; 2]),
+	FitToWindow(bool),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Action {
 	Show,
 	Hide,
@@ -60,6 +80,7 @@ pub enum Action {
 	Reset,
 	Close,
 	Nudge { direction: Direction, fine: bool },
+	Sizing(Sizing),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -79,6 +100,10 @@ pub struct HostPanels {
 	pub source: u32,
 	pub name: String,
 	pub max_panels: u32,
+	#[serde(default)]
+	pub resize_panel: bool,
+	#[serde(default)]
+	pub drag_panel: bool,
 	pub panels: Vec<Panel>,
 	pub targets: VirtualTargets,
 }

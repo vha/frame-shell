@@ -1,6 +1,7 @@
 # PRD — Keyboard and mouse control for the VR desktop
 
-**Status** · Proposed  
+**Status** · Implemented in the development builds. Steam Frame acceptance remains open.
+
 **Target** · Frame Shell on Steam Frame with a Hyprland PC host  
 **Related** · [Virtual PC panels and layout sync](../docs/pc-virtual-panels-prd.md)
 
@@ -113,3 +114,9 @@ Existing create messages already carry dimensions, the host already validates th
 - Confirm the preferred binding and whether a one-chord hold-to-drag gesture is required immediately or an explicit edit mode is acceptable for the first release.
 - Verify cursor position when a fitted output grows, shrinks or changes origin. Check which window constraints require fixed-resolution fallback.
 - Verify single-stream recovery and popup behavior on Steam Frame across repeated output resizes.
+
+## 9. Implementation notes
+
+- The opt-in Hyprland shortcut arms a temporary input surface before the left press. The picker can arm the same editor for an explicitly selected panel. Scroll adjusts depth, Shift+scroll adjusts scale, and Ctrl gives finer adjustment.
+- The PC picker exposes fixed resolution and fit status. Real mode changes preserve reachable mouse edges and can move a chain of adjacent virtual outputs. The host rolls the mode back if a compatible headset fails to confirm a decoded frame within the timeout.
+- Configuration and example shortcuts are in the [development guide](../DEVELOPMENT.md#pc-keyboard-controls-for-virtual-panels).

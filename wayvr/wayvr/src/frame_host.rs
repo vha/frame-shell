@@ -36,6 +36,7 @@ struct Pc {
     capture: Option<CaptureStatus>,
     virtual_state: Option<VirtualState>,
     virtual_targets: Option<VirtualTargets>,
+    pending_resize_frames: BTreeMap<u32, ([u32; 2], u64)>,
 }
 
 struct State {
@@ -114,6 +115,7 @@ pub fn connected(source: u32, _background: bool) {
             capture: None,
             virtual_state: None,
             virtual_targets: None,
+            pending_resize_frames: BTreeMap::new(),
         },
     );
     drop(state);
@@ -135,6 +137,7 @@ pub fn receive(source: u32, data: &[u8]) {
         return;
     };
     let vr = crate::frame_hosts::background_source() == Some(source);
+    let mut enable_resize_ack = false;
     match message {
         HostMessage::Games(games) => {
             let changed = pc.games.as_ref().is_none_or(|(_, old)| *old != games);
@@ -199,13 +202,15 @@ pub fn receive(source: u32, data: &[u8]) {
         HostMessage::IpcClose(id) => state.ipc.push_back(IpcEvent::Close(source, id)),
         HostMessage::Capture(capture) => pc.capture = Some(capture),
         HostMessage::VirtualState(virtual_state) => {
-            if pc.virtual_state.as_ref() != Some(&virtual_state) {
-                if pc
+            enable_resize_ack = virtual_state.capabilities.resize_panel
+                && !pc
                     .virtual_state
                     .as_ref()
-                    .map(|old| &old.panels)
-                    != Some(&virtual_state.panels)
-                {
+                    .is_some_and(|prev| prev.capabilities.resize_panel);
+            pc.pending_resize_frames
+                .retain(|surface, _| virtual_state.panels.iter().any(|p| p.surface == *surface));
+            if pc.virtual_state.as_ref() != Some(&virtual_state) {
+                if pc.virtual_state.as_ref().map(|old| &old.panels) != Some(&virtual_state.panels) {
                     crate::frame_shell::mark_virtual_layout_dirty();
                 }
                 pc.virtual_state = Some(virtual_state);
@@ -223,9 +228,46 @@ pub fn receive(source: u32, data: &[u8]) {
                 crate::frame_shell::bump_lobby_state();
             }
         }
+        HostMessage::VerifyVirtualResize {
+            surface,
+            size,
+            serial,
+        } => {
+            if pc
+                .virtual_state
+                .as_ref()
+                .is_some_and(|state| state.panels.iter().any(|p| p.surface == surface))
+            {
+                pc.pending_resize_frames.insert(surface, (size, serial));
+            }
+        }
     }
     drop(guard);
+    if enable_resize_ack {
+        send(source, &ShellMessage::EnableVirtualResizeAck);
+    }
     sync_presentation();
+}
+
+pub fn virtual_resize_decoded(source: u32, surface: u32, size: [u32; 2]) {
+    let serial = {
+        let mut state = state();
+        let Some(pc) = state.pcs.get_mut(&source) else {
+            return;
+        };
+        let Some((expected, serial)) = pc.pending_resize_frames.get(&surface).copied() else {
+            return;
+        };
+        if expected != size {
+            return;
+        }
+        pc.pending_resize_frames.remove(&surface);
+        serial
+    };
+    send(
+        source,
+        &ShellMessage::VirtualResizeDecoded { surface, serial },
+    );
 }
 
 pub fn composition_supported(source: u32) -> bool {

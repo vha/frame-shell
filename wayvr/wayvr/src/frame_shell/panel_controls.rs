@@ -21,16 +21,49 @@ use super::{EMBEDDED, layout_changed, virtual_overlay_name};
 pub(crate) fn handle_request<T: Default>(
     app: &mut AppState,
     overlays: &mut OverlayWindowManager<T>,
+    connection: u64,
     request: Request,
 ) -> Result<Response, String> {
     if !EMBEDDED.load(Ordering::Relaxed) {
         return Err("Virtual panel controls are available in Frame Shell.".into());
     }
+    let request = match request {
+        Request::BeginDragAtOutput { output } => {
+            let source = app
+                .ipc_server
+                .remote_source(connection)
+                .ok_or("Select a connected PC's panel in the picker first.")?;
+            let surface = frame_host::virtual_state(source)
+                .and_then(|state| {
+                    state
+                        .panels
+                        .into_iter()
+                        .find(|panel| panel.output_name == output)
+                })
+                .map(|panel| panel.surface)
+                .ok_or("No virtual panel under the cursor. Select a panel in the picker first.")?;
+            Request::BeginDrag { source, surface }
+        }
+        other => other,
+    };
     let source = match request {
         Request::List => return Ok(Response::Hosts(list_hosts(overlays))),
+        Request::DragMotion {
+            translation,
+            scale_steps,
+        } => {
+            super::drag_edit::motion(app, overlays, connection, translation, scale_steps)?;
+            return Ok(Response::Accepted);
+        }
+        Request::EndDrag { commit } => {
+            super::drag_edit::finish(app, overlays, connection, commit)?;
+            return Ok(Response::Accepted);
+        }
+        Request::BeginDrag { source, .. } => source,
         Request::Refresh { source }
         | Request::Create { source, .. }
         | Request::Control { source, .. } => source,
+        Request::BeginDragAtOutput { .. } => unreachable!(),
     };
     let state = frame_host::virtual_state(source).ok_or_else(|| {
         format!("PC {source} is disconnected or does not report virtual panel support.")
@@ -43,7 +76,23 @@ pub(crate) fn handle_request<T: Default>(
     }
 
     let message = match request {
-        Request::List => unreachable!("list returns before resolving the source"),
+        Request::List
+        | Request::BeginDragAtOutput { .. }
+        | Request::DragMotion { .. }
+        | Request::EndDrag { .. } => unreachable!(),
+        Request::BeginDrag { surface, .. } => {
+            let info = state
+                .panels
+                .iter()
+                .find(|p| p.surface == surface)
+                .ok_or("That virtual panel no longer exists.")?;
+            let name = virtual_overlay_name(source, surface, &info.output_name);
+            let id = overlays
+                .lookup(&name)
+                .ok_or("The panel has not appeared in the headset yet.")?;
+            super::drag_edit::begin(app, overlays, id, source, surface, connection)?;
+            return Ok(Response::Accepted);
+        }
         Request::Refresh { .. } => ShellMessage::RefreshVirtualTargets,
         Request::Create { target, size, .. } => {
             if !valid_size(size) {
@@ -88,6 +137,13 @@ pub(crate) fn handle_request<T: Default>(
         Request::Control {
             surface, action, ..
         } => {
+            if app
+                .panel_drag
+                .as_ref()
+                .is_some_and(|drag| drag.targets(source, surface))
+            {
+                return Err("Finish the mouse drag before changing this panel.".into());
+            }
             let info = state
                 .panels
                 .iter()
@@ -102,6 +158,19 @@ pub(crate) fn handle_request<T: Default>(
                         );
                     }
                     ShellMessage::FocusVirtualPanel { surface }
+                }
+                Action::Sizing(sizing) => {
+                    if !state.capabilities.resize_panel {
+                        return Err(
+                            "This PC server does not support changing panel resolution.".into()
+                        );
+                    }
+                    if let wayvr_ipc::virtual_panel::Sizing::Resolution(size) = sizing
+                        && !valid_size(size)
+                    {
+                        return Err(SIZE_REQUIREMENTS.into());
+                    }
+                    ShellMessage::SetVirtualPanelSizing { surface, sizing }
                 }
                 _ => {
                     let name = virtual_overlay_name(source, surface, &info.output_name);
@@ -141,6 +210,8 @@ fn list_hosts<T: Default>(overlays: &OverlayWindowManager<T>) -> Vec<HostPanels>
                 source,
                 name,
                 max_panels,
+                resize_panel: state.capabilities.resize_panel,
+                drag_panel: true,
                 panels,
                 targets: frame_host::virtual_targets(source).unwrap_or_default(),
             })
@@ -186,7 +257,7 @@ fn edit_overlay<T: Default>(
             overlay.config.dirty = true;
             layout_changed();
         }
-        Action::Close | Action::Focus => unreachable!("host action"),
+        Action::Close | Action::Focus | Action::Sizing(_) => unreachable!("host action"),
     }
     Ok(())
 }

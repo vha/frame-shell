@@ -883,7 +883,8 @@ pub fn stream_virtual_output(
                 let buffer = sample.buffer().context("Empty virtual encoded buffer")?;
                 let map = buffer.map_readable()?;
                 let bytes = map.len() as u64;
-                if !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                if keyframe {
                     metrics::emit(output_name, "keyframe", buffer.offset(), bytes);
                 }
                 metrics::emit(output_name, "encoded", buffer.offset(), bytes);
@@ -891,6 +892,9 @@ pub fn stream_virtual_output(
                     bail!("Virtual panel frame exceeds 4 MiB");
                 }
                 output.video(id, &map);
+                if keyframe {
+                    lock(&shared.virtual_keyframe_sizes).insert(id, size);
+                }
                 metrics::emit(output_name, "sent", buffer.offset(), bytes);
             }
 

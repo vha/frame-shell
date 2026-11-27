@@ -66,12 +66,22 @@ pub(crate) extern "C" fn desktop_frame(frame: *const DesktopFrame) {
     };
     let key = surface_key(frame.source, frame.surface);
     // A newer frame replaces one that wasn't shown yet
-    let replaced = match surfaces().get_mut(&key) {
-        Some(surface) => surface.frame.replace((*frame, fd)).map(|(old, _)| old.id),
-        None => Some(frame.id),
+    let (replaced, accepted_virtual) = match surfaces().get_mut(&key) {
+        Some(surface) => (
+            surface.frame.replace((*frame, fd)).map(|(old, _)| old.id),
+            surface.virtual_panel,
+        ),
+        None => (Some(frame.id), false),
     };
     if let Some(id) = replaced {
         release_frame(id);
+    }
+    if accepted_virtual {
+        crate::frame_host::virtual_resize_decoded(
+            frame.source,
+            frame.surface,
+            [frame.width, frame.height],
+        );
     }
 }
 
@@ -206,6 +216,10 @@ pub fn poll_virtual_layout<T: Default>(
                 source,
                 &wayvr_ipc::frame::ShellMessage::SyncPanelLayout {
                     placements: solution.targets,
+                    logical_sizes: virtuals
+                        .iter()
+                        .map(|p| (p.surface, p.logical_size))
+                        .collect(),
                 },
             );
         }

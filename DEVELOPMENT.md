@@ -75,26 +75,50 @@ Wayland display Lepton expects.
 
 Run `wayvrctl virtual-panel pick` in a PC terminal visible in the headset. The picker uses `fzf` for type-to-search,
 arrow keys, Enter and Escape. It offers active panel actions and blank, window and workspace shares, including a
-custom resolution. For example, to open it from Hyprland Lua, bind a free shortcut to your terminal:
+custom resolution. Bind free shortcuts in Hyprland Lua to open the picker and arm mouse drag.
 
 ```lua
-hl.bind("SUPER + SHIFT + V", hl.dsp.exec_cmd("foot wayvrctl virtual-panel pick"))
+hl.bind("SUPER + SHIFT + V", hl.dsp.exec_cmd("alacritty -e wayvrctl virtual-panel pick"))
+hl.bind("SUPER + ALT + V", hl.dsp.exec_cmd("wayvrctl virtual-panel drag"))
 ```
 
-The non-interactive commands work without `fzf`. Use the PC source and surface IDs from `list`. For example, on
-PC source 1 with virtual surface 2147483648:
+Point at a virtual output and press the drag shortcut. Then hold the left mouse button and move the mouse.
+Scroll while dragging for depth, hold Shift while scrolling for scale, or hold Ctrl for smaller adjustments.
+Release the mouse button to commit. Escape cancels. To move a panel when the cursor is on a physical screen,
+choose the panel in the picker and select **Drag with mouse**. The capture arms before the mouse press. Your
+regular Hyprland window-drag binding can stay in place.
+
+The non-interactive commands work without `fzf`. Use the PC source and surface IDs from `list`.
 
 ```sh
 wayvrctl --pretty virtual-panel list
 wayvrctl virtual-panel add 1 --size 1600x1000 blank
 wayvrctl virtual-panel nudge 1 2147483648 right --fine
 wayvrctl virtual-panel focus 1 2147483648
+wayvrctl virtual-panel resize 1 2147483648 1280x1440
+wayvrctl virtual-panel fit 1 2147483648 window
 ```
 
 `nudge` also accepts `up`, `down`, `left`, `nearer`, `farther`, `larger` and `smaller`. Move and scale commands
 apply to the visible VR panel. With layout sync enabled, the host repositions the virtual output after the existing
 debounce. The list holds the last reported window and workspace targets. Run `wayvrctl virtual-panel refresh 1` if
 you need to refresh them before opening the picker.
+
+Use **Display resolution** on a visible panel to change its actual virtual output mode. Dimensions must be even,
+640–3840 pixels wide and 480–2160 high. A window share defaults to **Fit to window** and follows the settled size
+of a single floating app. Tiled, fullscreen or constrained apps retain the last working mode, and the picker shows
+the fit status. Choosing a resolution switches that panel to **Fixed resolution**. Mode changes preserve reachable
+mouse edges and can shift adjacent virtual outputs to make room. If the layout has no room, move the panel first.
+
+Store optional PC picker defaults in `${XDG_CONFIG_HOME:-~/.config}/frame-shell/virtual-panels.json`.
+
+```json
+{
+  "drag_gain": 0.0015,
+  "default_resolution": [1920, 1080],
+  "resolutions": [[2560, 1440], [1280, 1440]]
+}
+```
 
 ## Several PCs
 

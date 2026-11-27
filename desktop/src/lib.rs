@@ -143,6 +143,11 @@ pub struct Shared {
     pub visibility: Mutex<HashMap<u32, bool>>,
     /// Monitors whose next frame must be a keyframe
     pub keyframes: Mutex<HashSet<u32>>,
+    /// Last keyframe sent by each virtual capture worker.
+    pub virtual_keyframe_sizes: Mutex<HashMap<u32, (u32, u32)>>,
+    pub resizing_virtual_outputs: Mutex<HashSet<u32>>,
+    pub virtual_resize_ack: AtomicBool,
+    pub decoded_virtual_resize: Mutex<Option<(u32, u64)>>,
     pub capture: Mutex<CaptureStatus>,
     pub output_layout: Mutex<capture::OutputLayout>,
 }
@@ -337,11 +342,32 @@ impl Host {
                     .send(virtual_panels::Command::Close { surface });
             }
             ShellMessage::FocusVirtualPanel { surface } => {
-                self.virtuals.send(virtual_panels::Command::Focus { surface });
-            }
-            ShellMessage::SyncPanelLayout { placements } => {
                 self.virtuals
-                    .send(virtual_panels::Command::SyncLayout { placements });
+                    .send(virtual_panels::Command::Focus { surface });
+            }
+            ShellMessage::SetVirtualPanelSizing { surface, sizing } => {
+                self.virtuals
+                    .send(virtual_panels::Command::SetSizing { surface, sizing });
+            }
+            ShellMessage::SyncPanelLayout {
+                placements,
+                logical_sizes,
+            } => {
+                self.virtuals.send(virtual_panels::Command::SyncLayout {
+                    placements,
+                    logical_sizes,
+                });
+            }
+            ShellMessage::EnableVirtualResizeAck => {
+                self.shared
+                    .virtual_resize_ack
+                    .store(true, Ordering::Release);
+            }
+            ShellMessage::VirtualResizeDecoded { surface, serial } => {
+                let mut ack = lock(&self.shared.decoded_virtual_resize);
+                if ack.is_none_or(|(_, previous)| previous < serial) {
+                    *ack = Some((surface, serial));
+                }
             }
         }
     }

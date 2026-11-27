@@ -1,5 +1,7 @@
 use std::{
+    env, fs,
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -8,12 +10,16 @@ use anyhow::{Context, Result, bail, ensure};
 use wayvr_ipc::{
     client::WayVRClient,
     virtual_panel::{
-        Action, DEFAULT_SIZE, Direction, HostPanels, Request, Response, SIZE_REQUIREMENTS, Target,
-        valid_size,
+        Action, DEFAULT_SIZE, Direction, HostPanels, Request, Response, SIZE_REQUIREMENTS, Sizing,
+        Target, valid_size,
     },
 };
 
 use crate::helper::WayVRClientState;
+
+mod capture_drag;
+
+const DEFAULT_DRAG_GAIN: f64 = 0.0015;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum CommandLine {
@@ -23,11 +29,20 @@ pub enum CommandLine {
     Refresh { pc: u32 },
     /// Choose a PC, panel or share target in an interactive terminal picker
     Pick,
+    /// Arm mouse drag for the panel under the PC cursor, or an explicitly selected panel
+    Drag {
+        #[arg(long, requires = "surface")]
+        pc: Option<u32>,
+        #[arg(long, requires = "pc")]
+        surface: Option<u32>,
+        #[arg(long)]
+        gain: Option<f64>,
+    },
     /// Share a blank screen, window or workspace at the given resolution
     Add {
         pc: u32,
-        #[arg(long, default_value = "1920x1080", value_parser = parse_size)]
-        size: [u32; 2],
+        #[arg(long, value_parser = parse_size)]
+        size: Option<[u32; 2]>,
         #[command(subcommand)]
         target: ShareTarget,
     },
@@ -41,6 +56,20 @@ pub enum CommandLine {
     Reset { pc: u32, surface: u32 },
     /// Close a panel and return its windows to the PC desktop
     Close { pc: u32, surface: u32 },
+    /// Change an active panel's display resolution
+    Resize {
+        pc: u32,
+        surface: u32,
+        #[arg(value_parser = parse_size)]
+        size: [u32; 2],
+    },
+    /// Choose whether a window panel follows its app's size
+    Fit {
+        pc: u32,
+        surface: u32,
+        #[arg(value_enum)]
+        mode: FitMode,
+    },
     /// Nudge a visible panel in VR
     Nudge {
         pc: u32,
@@ -57,6 +86,12 @@ pub enum ShareTarget {
     Blank,
     Window { address: String },
     Workspace { id: i32 },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum FitMode {
+    Window,
+    Fixed,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -93,6 +128,50 @@ fn parse_size(raw: &str) -> Result<[u32; 2]> {
     let size = [width.trim().parse()?, height.trim().parse()?];
     ensure!(valid_size(size), "{SIZE_REQUIREMENTS}");
     Ok(size)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    drag_gain: f64,
+    default_resolution: [u32; 2],
+    resolutions: Vec<[u32; 2]>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            drag_gain: DEFAULT_DRAG_GAIN,
+            default_resolution: DEFAULT_SIZE,
+            resolutions: vec![[2560, 1440], [1280, 1440]],
+        }
+    }
+}
+
+impl Settings {
+    fn load() -> Result<Self> {
+        let dir = env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+        let Some(path) = dir.map(|dir| dir.join("frame-shell/virtual-panels.json")) else {
+            return Ok(Self::default());
+        };
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err).with_context(|| format!("Read {}", path.display())),
+        };
+        let settings: Self =
+            serde_json::from_slice(&data).with_context(|| format!("Read {}", path.display()))?;
+        ensure!(
+            valid_size(settings.default_resolution)
+                && settings.resolutions.iter().copied().all(valid_size),
+            "{}: {SIZE_REQUIREMENTS}",
+            path.display()
+        );
+        Ok(settings)
+    }
 }
 
 fn control(source: u32, surface: u32, action: Action) -> Request {
@@ -142,15 +221,28 @@ pub async fn run(state: &mut WayVRClientState, command: CommandLine) -> Result<(
         CommandLine::Pick => {
             ensure!(io::stdin().is_terminal(), "Open the picker in a terminal.");
             let hosts = hosts(state).await?;
-            let Some(request) = smol::unblock(move || pick(hosts)).await? else {
-                return Ok(());
+            let settings = Settings::load()?;
+            let gain = settings.drag_gain;
+            match smol::unblock(move || pick(hosts, &settings)).await? {
+                Some(Pick::Request(request)) => request,
+                Some(Pick::Drag(target)) => return drag(state, Some(target), gain).await,
+                None => return Ok(()),
+            }
+        }
+        CommandLine::Drag { pc, surface, gain } => {
+            let gain = match gain {
+                Some(gain) => gain,
+                None => Settings::load()?.drag_gain,
             };
-            request
+            return drag(state, pc.zip(surface), gain).await;
         }
         CommandLine::Refresh { pc } => Request::Refresh { source: pc },
         CommandLine::Add { pc, size, target } => Request::Create {
             source: pc,
-            size,
+            size: match size {
+                Some(size) => size,
+                None => Settings::load()?.default_resolution,
+            },
             target: match target {
                 ShareTarget::Blank => Target::Blank,
                 ShareTarget::Window { address } => Target::Window(address),
@@ -162,6 +254,14 @@ pub async fn run(state: &mut WayVRClientState, command: CommandLine) -> Result<(
         CommandLine::Focus { pc, surface } => control(pc, surface, Action::Focus),
         CommandLine::Reset { pc, surface } => control(pc, surface, Action::Reset),
         CommandLine::Close { pc, surface } => control(pc, surface, Action::Close),
+        CommandLine::Resize { pc, surface, size } => {
+            control(pc, surface, Action::Sizing(Sizing::Resolution(size)))
+        }
+        CommandLine::Fit { pc, surface, mode } => control(
+            pc,
+            surface,
+            Action::Sizing(Sizing::FitToWindow(matches!(mode, FitMode::Window))),
+        ),
         CommandLine::Nudge {
             pc,
             surface,
@@ -176,21 +276,110 @@ pub async fn run(state: &mut WayVRClientState, command: CommandLine) -> Result<(
             },
         ),
     };
+    accept(state, request).await
+}
+
+async fn accept(state: &mut WayVRClientState, request: Request) -> Result<()> {
     match send(state, request).await? {
         Response::Accepted => Ok(()),
         Response::Hosts(_) => bail!("Unexpected response to virtual panel command."),
     }
 }
 
+#[derive(serde::Deserialize)]
+struct Cursor {
+    x: f64,
+    y: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct Monitor {
+    name: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
+    transform: u32,
+}
+
+fn hyprland_query<T: serde::de::DeserializeOwned>(query: &str) -> Result<T> {
+    let result = Command::new("hyprctl")
+        .args(["-j", query])
+        .output()
+        .context("Run hyprctl in the PC's Hyprland session.")?;
+    ensure!(result.status.success(), "Hyprland query {query} failed.");
+    serde_json::from_slice(&result.stdout).with_context(|| format!("Read Hyprland {query}"))
+}
+
+fn output_under_cursor() -> Result<String> {
+    let cursor: Cursor = hyprland_query("cursorpos")?;
+    let monitors: Vec<Monitor> = hyprland_query("monitors")?;
+    monitors
+        .into_iter()
+        .find(|m| {
+            let (w, h) = if m.transform % 2 == 0 {
+                (m.width, m.height)
+            } else {
+                (m.height, m.width)
+            };
+            cursor.x >= m.x
+                && cursor.x < m.x + w / m.scale
+                && cursor.y >= m.y
+                && cursor.y < m.y + h / m.scale
+        })
+        .map(|m| m.name)
+        .context("No Hyprland output under the cursor.")
+}
+
+async fn drag(state: &mut WayVRClientState, explicit: Option<(u32, u32)>, gain: f64) -> Result<()> {
+    ensure!(
+        (0.0001..=0.01).contains(&gain),
+        "Drag gain must be between 0.0001 and 0.01."
+    );
+    let output = smol::unblock(output_under_cursor).await?;
+    let begin = match explicit {
+        Some((source, surface)) => Request::BeginDrag { source, surface },
+        None => Request::BeginDragAtOutput {
+            output: output.clone(),
+        },
+    };
+    accept(state, begin).await?;
+
+    let (tx, rx) = smol::channel::bounded(4);
+    let capture = smol::spawn(smol::unblock(move || capture_drag::run(&output, gain, &tx)));
+    let mut motion_error = None;
+    while let Ok(request) = rx.recv().await {
+        if let Err(err) = accept(state, request).await {
+            motion_error = Some(err);
+            rx.close();
+            break;
+        }
+    }
+    let capture = capture.await;
+    let commit = motion_error.is_none() && capture.as_ref().is_ok_and(|commit| *commit);
+    let finish = accept(state, Request::EndDrag { commit }).await;
+    if let Some(err) = motion_error {
+        return Err(err);
+    }
+    capture?;
+    finish
+}
+
 enum Choice {
-    Existing(u32, bool),
+    Existing(wayvr_ipc::virtual_panel::Panel),
     Share {
         target: Target,
         already_shared: bool,
     },
 }
 
-fn pick(hosts: Vec<HostPanels>) -> Result<Option<Request>> {
+enum Pick {
+    Request(Request),
+    Drag((u32, u32)),
+}
+
+fn pick(hosts: Vec<HostPanels>, settings: &Settings) -> Result<Option<Pick>> {
     let labels: Vec<_> = hosts.iter().map(|host| host.name.clone()).collect();
     let index = match labels.len() {
         0 => bail!("No connected PCs support virtual panels."),
@@ -205,17 +394,25 @@ fn pick(hosts: Vec<HostPanels>) -> Result<Option<Request>> {
         .nth(index)
         .context("Invalid PC selection.")?;
     let mut entries = Vec::new();
-    for panel in &host.panels {
+    let can_add = host.panels.len() < host.max_panels as usize;
+    for panel in host.panels {
         let shown = if panel.visible { "shown" } else { "hidden" };
+        let detail = panel
+            .info
+            .fit_status
+            .as_deref()
+            .unwrap_or(match panel.info.fit_to_window {
+                Some(true) => "Fit to window",
+                _ => "Fixed resolution",
+            });
         entries.push((
             format!(
-                "{} · {} ({shown})",
-                panel.info.output_name, panel.info.title
+                "{} · {} · {}×{} ({shown}) · {detail}",
+                panel.info.output_name, panel.info.title, panel.info.width, panel.info.height
             ),
-            Choice::Existing(panel.info.surface, panel.visible),
+            Choice::Existing(panel),
         ));
     }
-    let can_add = host.panels.len() < host.max_panels as usize;
     if can_add {
         entries.push((
             "New blank output".into(),
@@ -280,34 +477,39 @@ fn pick(hosts: Vec<HostPanels>) -> Result<Option<Request>> {
             already_shared,
         } => {
             let size = if already_shared {
-                Some(DEFAULT_SIZE)
+                Some(settings.default_resolution)
             } else {
-                pick_size()?
+                pick_size(settings)?
             };
-            Ok(size.map(|size| Request::Create {
-                source: host.source,
-                target,
-                size,
+            Ok(size.map(|size| {
+                Pick::Request(Request::Create {
+                    source: host.source,
+                    target,
+                    size,
+                })
             }))
         }
-        Choice::Existing(surface, visible) => {
-            Ok(pick_action(visible)?.map(|action| control(host.source, surface, action)))
-        }
+        Choice::Existing(panel) => pick_action(
+            host.source,
+            &panel,
+            host.resize_panel,
+            host.drag_panel,
+            settings,
+        ),
     }
 }
 
-fn pick_size() -> Result<Option<[u32; 2]>> {
-    let labels = [
-        "1920×1080",
-        "2560×1440",
-        "1280×1440 portrait",
-        "Custom resolution…",
-    ];
+fn pick_size(settings: &Settings) -> Result<Option<[u32; 2]>> {
+    let mut sizes = vec![settings.default_resolution];
+    for &size in &settings.resolutions {
+        if !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    let mut labels: Vec<_> = sizes.iter().map(|[w, h]| format!("{w}×{h}")).collect();
+    labels.push("Custom resolution…".into());
     match choose("Resolution", &labels)? {
-        Some(0) => Ok(Some(DEFAULT_SIZE)),
-        Some(1) => Ok(Some([2560, 1440])),
-        Some(2) => Ok(Some([1280, 1440])),
-        Some(3) => {
+        Some(index) if index == sizes.len() => {
             eprint!("Resolution (WIDTHxHEIGHT, Enter to cancel): ");
             io::stderr().flush()?;
             let mut line = String::new();
@@ -318,11 +520,19 @@ fn pick_size() -> Result<Option<[u32; 2]>> {
             }
             Ok(Some(parse_size(size)?))
         }
-        _ => Ok(None),
+        Some(index) => Ok(sizes.get(index).copied()),
+        None => Ok(None),
     }
 }
 
-fn pick_action(visible: bool) -> Result<Option<Action>> {
+fn pick_action(
+    source: u32,
+    panel: &wayvr_ipc::virtual_panel::Panel,
+    can_resize: bool,
+    can_drag: bool,
+    settings: &Settings,
+) -> Result<Option<Pick>> {
+    let visible = panel.visible;
     let mut entries = vec![
         ("Focus", Action::Focus),
         if visible {
@@ -353,8 +563,40 @@ fn pick_action(visible: bool) -> Result<Option<Action>> {
         }
     }
     entries.push(("Close", Action::Close));
-    let labels: Vec<_> = entries.iter().map(|(label, _)| *label).collect();
-    Ok(choose("Action", &labels)?.map(|index| entries[index].1))
+    if can_resize && let Some(fit) = panel.info.fit_to_window {
+        let label = if fit {
+            "Fixed resolution"
+        } else {
+            "Fit to window"
+        };
+        entries.push((label, Action::Sizing(Sizing::FitToWindow(!fit))));
+    }
+    let mut labels: Vec<_> = entries.iter().map(|(label, _)| *label).collect();
+    let resize = can_resize && visible;
+    let drag = can_drag && visible;
+    if resize {
+        labels.push("Display resolution…");
+    }
+    if drag {
+        labels.push("Drag with mouse");
+    }
+    let Some(index) = choose("Action", &labels)? else {
+        return Ok(None);
+    };
+    let surface = panel.info.surface;
+    if let Some((_, action)) = entries.get(index) {
+        return Ok(Some(Pick::Request(control(source, surface, *action))));
+    }
+    if resize && index == entries.len() {
+        return Ok(pick_size(settings)?.map(|size| {
+            Pick::Request(control(
+                source,
+                surface,
+                Action::Sizing(Sizing::Resolution(size)),
+            ))
+        }));
+    }
+    Ok(Some(Pick::Drag((source, surface))))
 }
 
 /// fzf handles terminal modes, arrow keys and Escape. Numeric row IDs are
@@ -429,7 +671,7 @@ mod tests {
             crate::Subcommands::VirtualPanel {
                 command: CommandLine::Add {
                     pc: 1,
-                    size: [1600, 1000],
+                    size: Some([1600, 1000]),
                     target: ShareTarget::Blank
                 },
             }
