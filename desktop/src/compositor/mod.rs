@@ -123,6 +123,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             VirtualCapabilities {
                 focus_panel: false,
                 resize_panel: false,
+                window_follow: false,
                 supported: false,
                 compositor: name.to_ascii_lowercase(),
                 reason: Some("Virtual panels currently require Hyprland.".into()),
@@ -139,6 +140,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
                 VirtualCapabilities {
                     focus_panel: false,
                     resize_panel: false,
+                    window_follow: false,
                     supported: false,
                     compositor: "hyprland".into(),
                     reason: Some(format!("Hyprland IPC socket unavailable: {err:#}")),
@@ -154,6 +156,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             VirtualCapabilities {
                 focus_panel: false,
                 resize_panel: false,
+                window_follow: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(format!("Cannot query Hyprland IPC socket: {err:#}")),
@@ -168,6 +171,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             VirtualCapabilities {
                 focus_panel: false,
                 resize_panel: false,
+                window_follow: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(
@@ -184,6 +188,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
             VirtualCapabilities {
                 focus_panel: false,
                 resize_panel: false,
+                window_follow: false,
                 supported: false,
                 compositor: "hyprland".into(),
                 reason: Some(
@@ -199,6 +204,7 @@ pub fn detect() -> (Option<Arc<dyn CompositorBackend>>, VirtualCapabilities) {
         VirtualCapabilities {
             focus_panel: true,
             resize_panel: true,
+            window_follow: true,
             supported: true,
             compositor: "hyprland".into(),
             reason: None,

@@ -239,7 +239,7 @@ impl OverlayWindowConfig {
         let Some(state) = self.active_state.as_ref() else {
             return false;
         };
-        let transform = state.transform;
+        let transform = self.surface_transform(state.transform);
         let curvature = state.curvature;
 
         let Some((_dist, local_pos)) = raycast_overlay(ray, &transform, curvature) else {
@@ -251,6 +251,10 @@ impl OverlayWindowConfig {
 
         let uv = interaction_transform.transform_point2(local_pos);
         (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)
+    }
+
+    pub(crate) fn surface_transform(&self, pose: Affine3A) -> Affine3A {
+        pose * Affine3A::from_scale(glam::Vec3::splat(self.backend.surface_scale()))
     }
 
     fn auto_movement(&mut self, app: &mut AppState) {

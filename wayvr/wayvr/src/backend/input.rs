@@ -943,7 +943,7 @@ where
         if let Some(hit) = ray_test(
             &ray_origin,
             id,
-            &overlay_state.transform,
+            &overlay.config.surface_transform(overlay_state.transform),
             overlay_state.curvature.as_ref(),
         ) && hit.dist.is_finite()
         {

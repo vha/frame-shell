@@ -129,6 +129,53 @@ pub fn clear_virtual_layout(source: u32) {
         .remove(&source);
 }
 
+pub fn poll_window_moves<T: Default>(
+    app: &AppState,
+    overlays: &mut crate::windowing::manager::OverlayWindowManager<T>,
+) {
+    for movement in crate::frame_host::take_window_moves() {
+        let Some(panel) = crate::frame_host::virtual_state(movement.source).and_then(|state| {
+            state.panels.into_iter().find(|panel| {
+                panel.surface == movement.surface && panel.fit_to_window == Some(true)
+            })
+        }) else {
+            continue;
+        };
+        let name = virtual_overlay_name(movement.source, panel.surface, &panel.output_name);
+        let Some(id) = overlays.lookup(&name) else {
+            continue;
+        };
+        if app.anchor_grabbed || app.panel_drag.is_some() || app.input_state.is_grabbing_overlay(id)
+        {
+            continue;
+        }
+        let Some(overlay) = overlays.mut_by_id(id) else {
+            continue;
+        };
+        let scale = overlay.config.backend.surface_scale();
+        let Some(state) = overlay
+            .config
+            .active_state
+            .as_mut()
+            .filter(|state| state.alpha > 0.05 && state.grabbable)
+        else {
+            continue;
+        };
+        let [width, height] = movement.output_size;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let [dx, dy] = movement
+            .delta
+            .map(|v| v as f32 / width.max(height) as f32 * scale);
+        let transform = &mut state.transform;
+        transform.translation +=
+            (transform.x_axis * dx - transform.y_axis * dy).clamp_length_max(3.0);
+        overlay.config.dirty = true;
+        layout_changed();
+    }
+}
+
 /// Solves and pushes 2D compositor panel coordinates when virtual panel 3D poses settle (~350 ms debounce).
 pub fn poll_virtual_layout<T: Default>(
     overlays: &crate::windowing::manager::OverlayWindowManager<T>,
@@ -517,18 +564,7 @@ pub(crate) fn desktop_overlay(name: Arc<str>, key: u64, app: &AppState) -> Overl
             ),
             ..Default::default()
         },
-        ..OverlayWindowConfig::from_backend(Box::new(DesktopOverlay {
-            name: name.clone(),
-            key,
-            offline: None,
-            redraw: false,
-            meta: None,
-            planes: None,
-            shown: None,
-            imports: HashMap::new(),
-            renderer: None,
-            last_hover: None,
-        }))
+        ..OverlayWindowConfig::from_backend(Box::new(DesktopOverlay::new(name, key)))
     }
 }
 
@@ -541,6 +577,8 @@ pub(crate) struct DesktopOverlay {
     /// Redraw without a new frame: edit mode left its panel in the swapchain image
     redraw: bool,
     meta: Option<FrameMeta>,
+    /// Use the first stream's pixel density for later virtual output modes.
+    initial_long_edge: Option<std::num::NonZeroU32>,
     /// Luma and chroma views of the frame being shown
     planes: Option<(Arc<ImageView>, Arc<ImageView>)>,
     /// Decoder buffer of the frame being shown, released once a newer one is: WayVR waits for the previous
@@ -600,6 +638,22 @@ fn screen_state(name: &str) -> [String; 3] {
 }
 
 impl DesktopOverlay {
+    fn new(name: Arc<str>, key: u64) -> Self {
+        Self {
+            name,
+            key,
+            offline: None,
+            redraw: false,
+            meta: None,
+            initial_long_edge: None,
+            planes: None,
+            shown: None,
+            imports: HashMap::new(),
+            renderer: None,
+            last_hover: None,
+        }
+    }
+
     /// The placeholder, rebuilt when what it says changes
     fn placeholder(&mut self, app: &mut AppState) -> anyhow::Result<ShouldRender> {
         let state = screen_state(&self.name);
@@ -660,6 +714,13 @@ impl Drop for DesktopOverlay {
 }
 
 impl OverlayBackend for DesktopOverlay {
+    fn surface_scale(&self) -> f32 {
+        self.initial_long_edge.zip(self.meta).map_or(1.0, |(initial, meta)| {
+            let [width, height] = meta.extent;
+            width.max(height) as f32 / initial.get() as f32
+        })
+    }
+
     fn init(&mut self, _: &mut AppState) -> anyhow::Result<()> {
         Ok(())
     }
@@ -748,6 +809,9 @@ impl OverlayBackend for DesktopOverlay {
             // Also after a disconnect, which drops the renderer but keeps the size for the placeholder
             if self.renderer.is_none() || self.meta.is_none_or(|old| old.extent != extent) {
                 self.renderer = Some(Nv12ScreenPipeline::new(&meta, app)?);
+            }
+            if wayvr_ipc::frame::is_virtual_surface(self.key as u32) && self.initial_long_edge.is_none() {
+                self.initial_long_edge = std::num::NonZeroU32::new(frame.width.max(frame.height));
             }
             self.meta = Some(meta);
             Ok(ShouldRender::Should)
@@ -841,5 +905,28 @@ impl OverlayBackend for DesktopOverlay {
     }
     fn set_attrib(&mut self, _: &mut AppState, _: BackendAttribValue) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_desktop_keeps_pixel_density_as_either_edge_grows() {
+        let mut desktop = DesktopOverlay::new("test panel".into(), 0);
+        desktop.initial_long_edge = std::num::NonZeroU32::new(1200);
+        for extent in [[1200, 800], [1600, 800], [1200, 1400]] {
+            desktop.meta = Some(FrameMeta {
+                extent,
+                ..Default::default()
+            });
+            let uv_per_unit = desktop.get_interaction_transform().unwrap().matrix2;
+            let dimensions = [uv_per_unit.x_axis.x, -uv_per_unit.y_axis.y]
+                .map(|axis| desktop.surface_scale() / axis);
+            for axis in 0..2 {
+                assert!((dimensions[axis] - extent[axis] as f32 / 1200.0).abs() < 0.0001);
+            }
+        }
     }
 }

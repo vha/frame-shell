@@ -110,6 +110,10 @@ of a single floating app. Tiled, fullscreen or constrained apps retain the last 
 the fit status. Choosing a resolution switches that panel to **Fixed resolution**. Mode changes preserve reachable
 mouse edges and can shift adjacent virtual outputs to make room. If the layout has no room, move the panel first.
 
+Drag a single floating app in **Fit to window** mode with your usual window gesture to move its VR panel.
+Frame Shell follows when the window and pointer settle. **Auto-sync VR layout to desktop** snaps the virtual
+output to a valid desktop position. Resizing the app on one axis keeps the other VR dimension the same.
+
 Store optional PC picker defaults in `${XDG_CONFIG_HOME:-~/.config}/frame-shell/virtual-panels.json`.
 
 ```json

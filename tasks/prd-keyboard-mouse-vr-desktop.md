@@ -119,4 +119,5 @@ Existing create messages already carry dimensions, the host already validates th
 
 - The opt-in Hyprland shortcut arms a temporary input surface before the left press. The picker can arm the same editor for an explicitly selected panel. Scroll adjusts depth, Shift+scroll adjusts scale, and Ctrl gives finer adjustment.
 - The PC picker exposes fixed resolution and fit status. Real mode changes preserve reachable mouse edges and can move a chain of adjacent virtual outputs. The host rolls the mode back if a compatible headset fails to confirm a decoded frame within the timeout.
+- In **Fit to window** mode, a normal Hyprland drag moves the VR panel after the floating window and pointer settle. The panel keeps the pixel density of its first streamed mode when the app resizes.
 - Configuration and example shortcuts are in the [development guide](../DEVELOPMENT.md#pc-keyboard-controls-for-virtual-panels).

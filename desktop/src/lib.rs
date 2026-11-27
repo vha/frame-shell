@@ -147,6 +147,7 @@ pub struct Shared {
     pub virtual_keyframe_sizes: Mutex<HashMap<u32, (u32, u32)>>,
     pub resizing_virtual_outputs: Mutex<HashSet<u32>>,
     pub virtual_resize_ack: AtomicBool,
+    pub virtual_window_follow: AtomicBool,
     pub decoded_virtual_resize: Mutex<Option<(u32, u64)>>,
     pub capture: Mutex<CaptureStatus>,
     pub output_layout: Mutex<capture::OutputLayout>,
@@ -362,6 +363,9 @@ impl Host {
                 self.shared
                     .virtual_resize_ack
                     .store(true, Ordering::Release);
+            }
+            ShellMessage::EnableVirtualWindowFollow => {
+                self.shared.virtual_window_follow.store(true, Ordering::Release);
             }
             ShellMessage::VirtualResizeDecoded { surface, serial } => {
                 let mut ack = lock(&self.shared.decoded_virtual_resize);

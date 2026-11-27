@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use wayvr_ipc::virtual_panel::{SIZE_REQUIREMENTS, Sizing, valid_size};
 
-use super::{ActivePanel, PanelOwnership, Worker, preserve_cursor, to_output_geos};
+use super::{
+    ActivePanel, PanelOwnership, Worker, preserve_cursor, to_output_geos,
+    window_follow::WindowFollow,
+};
 use crate::{
     capture::is_virtual_output_name,
     compositor::{MonitorGeometry, WindowInfo, wlr_output::OutputConfigUpdate},
@@ -24,6 +27,7 @@ pub(super) struct FitWindow {
     attempted: Option<[u32; 2]>,
     last_attempt_failed: bool,
     settle_until: Option<Instant>,
+    movement: WindowFollow,
 }
 
 impl Default for FitWindow {
@@ -35,6 +39,7 @@ impl Default for FitWindow {
             attempted: None,
             last_attempt_failed: false,
             settle_until: None,
+            movement: WindowFollow::default(),
         }
     }
 }
@@ -168,11 +173,18 @@ impl Worker {
                 .values_mut()
                 .filter_map(|panel| panel.fit.as_mut())
             {
+                fit.movement = WindowFollow::default();
                 if fit.last_attempt_failed {
                     fit.observed = None;
                 }
             }
         }
+        let cursor = self
+            .shared
+            .virtual_window_follow
+            .load(Ordering::Acquire)
+            .then(|| backend.cursor_position().ok())
+            .flatten();
         let mut publish = false;
         for id in active {
             let panel = &mut self.panels.get_mut(&id).expect("active fit panel");
@@ -186,6 +198,10 @@ impl Worker {
             };
             let fit = panel.fit.as_mut().expect("active fit");
             let window = windows.iter().find(|w| &w.address == address);
+            if window.is_some_and(|w| w.workspace_id != *panel_workspace_id) {
+                // The workspace-change event may be queued behind this poll.
+                continue;
+            }
             let monitor = monitors.iter().find(|m| m.name == panel.output_name);
             let proposal = window.zip(monitor).and_then(|(window, monitor)| {
                 let count = windows
@@ -193,7 +209,6 @@ impl Worker {
                     .filter(|w| w.workspace_id == *panel_workspace_id)
                     .count();
                 (count == 1
-                    && window.workspace_id == *panel_workspace_id
                     && window.monitor_name == monitor.name
                     && window.floating
                     && !window.fullscreen
@@ -219,9 +234,29 @@ impl Worker {
                     fit.observed = None;
                     fit.attempted = None;
                     fit.settle_until = None;
+                    fit.movement = WindowFollow::default();
                     continue;
                 }
             };
+            if fit.settle_until.is_none() && size == output_size {
+                if let (Some(cursor), Some(monitor)) = (cursor, monitor)
+                    && let Some(delta) = fit.movement.observe(window, cursor, now)
+                {
+                    if let Ok(pos) = recenter(backend.as_ref(), monitor, window, border) {
+                        preserve_cursor(backend.as_ref(), monitor, cursor, window.pos, pos);
+                        self.output
+                            .send(&wayvr_ipc::frame::HostMessage::VirtualWindowMoved {
+                                surface: id,
+                                delta,
+                                output_size,
+                            });
+                    }
+                    fit.movement = WindowFollow::default();
+                    continue;
+                }
+            } else {
+                fit.movement = WindowFollow::default();
+            }
             let was_settling = fit.settle_until.is_some();
             if !fit.ready(size, now, output_size) {
                 publish |= was_settling && fit.settle_until.is_none() && fit.status.is_some();
@@ -231,6 +266,7 @@ impl Worker {
             let window_before = window.clone();
             let result = self.resize_panel(id, size, Some((&window_before, border)));
             if let Some(fit) = self.panels.get_mut(&id).and_then(|p| p.fit.as_mut()) {
+                fit.movement = WindowFollow::default();
                 fit.status = result.as_ref().err().map(|err| format!("{err:#}"));
                 fit.last_attempt_failed = result.is_err();
                 if result.is_ok() {
@@ -244,6 +280,79 @@ impl Worker {
         if publish {
             self.broadcast_state();
         }
+    }
+
+    pub(super) fn follow_window_across_outputs(&mut self, surface: u32) -> bool {
+        if !self.shared.virtual_window_follow.load(Ordering::Acquire) || !self.visible(surface) {
+            return false;
+        }
+        let Some(backend) = self.backend.as_ref() else {
+            return false;
+        };
+        let Some(panel) = self.panels.get_mut(&surface) else {
+            return false;
+        };
+        let PanelOwnership::Window {
+            address,
+            panel_workspace_id,
+            ..
+        } = &panel.ownership
+        else {
+            return false;
+        };
+        let Some(fit) = panel
+            .fit
+            .as_mut()
+            .filter(|fit| fit.enabled && fit.settle_until.is_none())
+        else {
+            return false;
+        };
+        let (Ok(windows), Ok(monitors), Ok(cursor), Ok(border)) = (
+            backend.list_windows(),
+            backend.list_monitors(),
+            backend.cursor_position(),
+            backend.window_border(),
+        ) else {
+            return false;
+        };
+        let Some(window) = windows.iter().find(|w| &w.address == address) else {
+            return false;
+        };
+        if window.workspace_id == *panel_workspace_id {
+            return true; // A queued event for a window already back on its panel.
+        }
+        let Some(monitor) = monitors.iter().find(|monitor| {
+            monitor.name == panel.output_name && monitor.active_workspace_id == *panel_workspace_id
+        }) else {
+            return false;
+        };
+        if window.monitor_name == monitor.name
+            || !window.floating
+            || window.fullscreen
+            || window.pinned
+        {
+            return false;
+        }
+        let Some(delta) = fit.movement.crossed(window, cursor, Instant::now()) else {
+            return false;
+        };
+        if backend
+            .move_window_to_workspace(address, &panel_workspace_id.to_string())
+            .is_err()
+        {
+            return false;
+        }
+        fit.movement = WindowFollow::default();
+        if let Ok(pos) = recenter(backend.as_ref(), monitor, window, border) {
+            preserve_cursor(backend.as_ref(), monitor, cursor, window.pos, pos);
+            self.output
+                .send(&wayvr_ipc::frame::HostMessage::VirtualWindowMoved {
+                    surface,
+                    delta,
+                    output_size: [monitor.width, monitor.height],
+                });
+        }
+        true
     }
 
     fn resize_panel(
@@ -322,23 +431,38 @@ impl Worker {
         let result = (|| -> Result<()> {
             backend.configure_outputs(&updates(size, false))?;
             applied = true;
-            let confirmed = backend.list_monitors()?;
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let confirmed = loop {
+                let current = backend.list_monitors()?;
+                let matches_target = current.iter().any(|m| {
+                    m.name == name && [m.width, m.height] == size && m.logical_pos == position
+                });
+                let matches_neighbors = monitors.iter().zip(&positions).all(|(prev, &pos)| {
+                    prev.logical_pos == pos
+                        || current
+                            .iter()
+                            .any(|m| m.name == prev.name && m.logical_pos == pos)
+                });
+                if matches_target
+                    && matches_neighbors
+                    && layout_has_no_virtual_overlaps(&current, &[])
+                {
+                    break current;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "The compositor did not apply {name} at {position:?} with mode {size:?}; got {:?}.",
+                    current
+                        .iter()
+                        .find(|m| m.name == name)
+                        .map(|m| (m.logical_pos, [m.width, m.height]))
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
             let monitor = confirmed
                 .iter()
                 .find(|m| m.name == name)
                 .context("Resized output disappeared.")?;
-            ensure!(
-                [monitor.width, monitor.height] == size
-                    && monitor.logical_pos == position
-                    && layout_has_no_virtual_overlaps(&confirmed, &[])
-                    && monitors.iter().zip(&positions).all(|(prev, &pos)| {
-                        prev.logical_pos == pos
-                            || confirmed
-                                .iter()
-                                .any(|m| m.name == prev.name && m.logical_pos == pos)
-                    }),
-                "The compositor did not apply the requested output geometry."
-            );
             self.shared
                 .update_outputs(&self.output, to_output_geos(&confirmed));
             let recentered = fit

@@ -55,6 +55,11 @@ pub enum HostMessage {
 		size: [u32; 2],
 		serial: u64,
 	},
+	VirtualWindowMoved {
+		surface: u32,
+		delta: [i32; 2],
+		output_size: [u32; 2],
+	},
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -126,6 +131,7 @@ pub enum ShellMessage {
 		logical_sizes: Vec<(u32, [i32; 2])>,
 	},
 	EnableVirtualResizeAck,
+	EnableVirtualWindowFollow,
 	VirtualResizeDecoded {
 		surface: u32,
 		serial: u64,
@@ -138,6 +144,8 @@ pub struct VirtualCapabilities {
 	pub focus_panel: bool,
 	#[serde(default)]
 	pub resize_panel: bool,
+	#[serde(default)]
+	pub window_follow: bool,
 	pub supported: bool,
 	pub compositor: String,
 	pub reason: Option<String>,
@@ -344,6 +352,7 @@ mod tests {
 	fn virtual_messages_round_trip() {
 		let state = HostMessage::VirtualState(VirtualState {
 			capabilities: VirtualCapabilities {
+				window_follow: true,
 				focus_panel: true,
 				resize_panel: true,
 				supported: true,

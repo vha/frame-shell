@@ -1,6 +1,7 @@
 //! Virtual headless panel lifecycle manager for interactive VR desktop panels.
 
 mod sizing;
+mod window_follow;
 
 use crate::{
     Output, Shared, capture,
@@ -899,6 +900,10 @@ impl Worker {
                     .then_some(id)
                 });
                 if let Some(surface) = moved_off {
+                    if self.follow_window_across_outputs(surface) {
+                        self.broadcast_targets();
+                        return;
+                    }
                     eprintln!(
                         "Popped-out window {norm} moved away from virtual workspace; closing virtual panel"
                     );
@@ -1419,7 +1424,7 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
             }
             let deadline = Instant::now() + Duration::from_secs(6);
-            loop {
+            let fitted = loop {
                 let events = events_ref.lock().unwrap();
                 let latest = events.messages.iter().rev().find_map(|msg| match msg {
                     HostMessage::VirtualState(state) => {
@@ -1441,7 +1446,7 @@ mod tests {
                     );
                     assert_eq!(app.pos, p.logical_pos.map(|axis| axis + border as i32));
                     assert!(events.videos.contains(&p.surface));
-                    break;
+                    break [p.width, p.height];
                 }
                 assert!(
                     Instant::now() < deadline,
@@ -1449,6 +1454,93 @@ mod tests {
                 );
                 drop(events);
                 std::thread::sleep(Duration::from_millis(25));
+            };
+            std::thread::sleep(Duration::from_millis(650));
+            let cmd = format!(
+                "hl.dsp.window.resize({{ window = 'address:{address}', x = 200, y = 0, relative = true }})"
+            );
+            let reply = std::process::Command::new("hyprctl")
+                .args(["dispatch", &cmd])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&reply.stdout).trim(), "ok");
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                let events = lock(events_ref);
+                let latest = events.messages.iter().rev().find_map(|msg| match msg {
+                    HostMessage::VirtualState(state) => {
+                        state.panels.iter().find(|p| p.surface == panel.surface)
+                    }
+                    _ => None,
+                });
+                if let Some(p) = latest.filter(|p| p.width == fitted[0] + 200) {
+                    assert_eq!(p.height, fitted[1]);
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "width-only fit did not settle: {latest:?}"
+                );
+                drop(events);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+
+            if let Some(helper) = std::env::var_os("FRAME_TEST_WINDOW_DRAG") {
+                shared.virtual_window_follow.store(true, Ordering::Release);
+                for (index, delta) in [120_i32, -260].into_iter().enumerate() {
+                    let origin = backend
+                        .list_windows()
+                        .unwrap()
+                        .into_iter()
+                        .find(|w| w.address == address)
+                        .unwrap();
+                    backend
+                        .move_cursor([origin.pos[0] + 110, origin.pos[1] + 100])
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(800));
+                    assert!(
+                        std::process::Command::new(&helper)
+                            .arg(delta.to_string())
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(4);
+                    loop {
+                        let events = lock(events_ref);
+                        let movement = events
+                            .messages
+                            .iter()
+                            .filter_map(|msg| match msg {
+                                HostMessage::VirtualWindowMoved { surface, delta, .. }
+                                    if *surface == panel.surface =>
+                                {
+                                    Some(*delta)
+                                }
+                                _ => None,
+                            })
+                            .nth(index);
+                        if let Some([dx, dy]) = movement {
+                            assert_eq!(dx.signum(), delta.signum());
+                            assert!(dy.abs() < 35);
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "window drag ({delta}) did not move the panel"
+                        );
+                        drop(events);
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    let returned = backend
+                        .list_windows()
+                        .unwrap()
+                        .into_iter()
+                        .find(|w| w.address == address)
+                        .unwrap();
+                    assert_eq!(returned.workspace_id, origin.workspace_id);
+                    assert_eq!(returned.pos, origin.pos);
+                }
             }
             manager_ref.send(Command::Close {
                 surface: panel.surface,

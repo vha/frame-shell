@@ -48,6 +48,7 @@ struct State {
     errors: VecDeque<String>,
     notifications: VecDeque<Notification>,
     virtual_reveals: Vec<(u32, u32)>,
+    window_moves: Vec<WindowMove>,
     ipc: VecDeque<IpcEvent>,
 }
 
@@ -58,6 +59,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     errors: VecDeque::new(),
     notifications: VecDeque::new(),
     virtual_reveals: Vec::new(),
+    window_moves: Vec::new(),
     ipc: VecDeque::new(),
 });
 
@@ -138,6 +140,7 @@ pub fn receive(source: u32, data: &[u8]) {
     };
     let vr = crate::frame_hosts::background_source() == Some(source);
     let mut enable_resize_ack = false;
+    let mut enable_window_follow = false;
     match message {
         HostMessage::Games(games) => {
             let changed = pc.games.as_ref().is_none_or(|(_, old)| *old != games);
@@ -202,6 +205,11 @@ pub fn receive(source: u32, data: &[u8]) {
         HostMessage::IpcClose(id) => state.ipc.push_back(IpcEvent::Close(source, id)),
         HostMessage::Capture(capture) => pc.capture = Some(capture),
         HostMessage::VirtualState(virtual_state) => {
+            enable_window_follow = virtual_state.capabilities.window_follow
+                && !pc
+                    .virtual_state
+                    .as_ref()
+                    .is_some_and(|old| old.capabilities.window_follow);
             enable_resize_ack = virtual_state.capabilities.resize_panel
                 && !pc
                     .virtual_state
@@ -244,10 +252,27 @@ pub fn receive(source: u32, data: &[u8]) {
                 pc.pending_resize_frames.insert(surface, (size, serial));
             }
         }
+        HostMessage::VirtualWindowMoved {
+            surface,
+            delta,
+            output_size,
+        } => {
+            if state.window_moves.len() < 32 {
+                state.window_moves.push(WindowMove {
+                    source,
+                    surface,
+                    delta,
+                    output_size,
+                });
+            }
+        }
     }
     drop(guard);
     if enable_resize_ack {
         send(source, &ShellMessage::EnableVirtualResizeAck);
+    }
+    if enable_window_follow {
+        send(source, &ShellMessage::EnableVirtualWindowFollow);
     }
     sync_presentation();
 }
@@ -419,6 +444,17 @@ pub fn take_errors() -> Vec<String> {
 
 pub fn take_virtual_reveals() -> Vec<(u32, u32)> {
     std::mem::take(&mut state().virtual_reveals)
+}
+
+pub struct WindowMove {
+    pub source: u32,
+    pub surface: u32,
+    pub delta: [i32; 2],
+    pub output_size: [u32; 2],
+}
+
+pub fn take_window_moves() -> Vec<WindowMove> {
+    std::mem::take(&mut state().window_moves)
 }
 
 pub fn take_notifications() -> Vec<Notification> {
