@@ -180,7 +180,8 @@ pub fn poll_virtual_layout<T: Default>(
                 overlay_transform: transform,
             });
         }
-        if virtuals.is_empty() {
+        // A panel without an overlay pose still occupies space in Hyprland.
+        if virtuals.len() != vstate.panels.len() {
             continue;
         }
         let prev = COMMITTED_PLACEMENTS
@@ -216,7 +217,12 @@ pub fn poll_virtual_layout<T: Default>(
     }
 
     if !waiting_for_spawn {
-        VIRTUAL_LAYOUT_DIRTY_MS.store(0, Ordering::Relaxed);
+        let _ = VIRTUAL_LAYOUT_DIRTY_MS.compare_exchange(
+            dirty_at,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 }
 

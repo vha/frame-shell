@@ -205,6 +205,7 @@ struct Worker {
     panels: BTreeMap<u32, ActivePanel>,
     next_slot: u32,
     next_fit_poll: std::time::Instant,
+    last_fit_layout: Vec<MonitorGeometry>,
     next_resize_serial: u64,
 }
 
@@ -790,32 +791,46 @@ impl Worker {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        let Ok(monitors) = backend.list_monitors() else {
+            return;
+        };
         if logical_sizes.iter().any(|(surface, size)| {
-            self.panels
-                .get(surface)
-                .is_none_or(|p| p.logical_size != *size)
+            self.panels.get(surface).is_none_or(|p| {
+                !monitors.iter().any(|m| {
+                    p.output_name == m.name && [m.logical_size.0, m.logical_size.1] == *size
+                })
+            })
         }) {
+            self.broadcast_state();
             return;
         }
         let mut updates = Vec::new();
         for target in &placements {
             if let Some(panel) = self.panels.get(&target.surface)
-                && panel.logical_pos != [target.x, target.y]
+                && let Some(monitor) = monitors.iter().find(|m| m.name == panel.output_name)
+                && monitor.logical_pos != (target.x, target.y)
             {
                 updates.push(OutputConfigUpdate {
                     name: panel.output_name.clone(),
-                    mode: Some((panel.width, panel.height, 60)),
+                    mode: None,
                     pos: Some((target.x, target.y)),
-                    scale: Some(panel.scale),
+                    scale: None,
                 });
             }
         }
         if updates.is_empty() {
+            self.broadcast_state();
+            return;
+        }
+        if !sizing::layout_has_no_virtual_overlaps(&monitors, &updates) {
+            let message = "Skipped virtual panel layout sync because the outputs would overlap.";
+            eprintln!("{message}");
+            self.output.send(&HostMessage::Error(message.into()));
+            self.broadcast_state();
             return;
         }
         let cursor = backend.cursor_position().ok().and_then(|pointer| {
-            let monitors = backend.list_monitors().ok()?;
-            let old = monitors.into_iter().find(|monitor| {
+            let old = monitors.iter().find(|monitor| {
                 monitor.contains(pointer) && updates.iter().any(|u| u.name == monitor.name)
             })?;
             Some((pointer, old))
@@ -837,12 +852,6 @@ impl Worker {
                         );
                     }
                     self.refresh_panel_geometries(&monitors);
-                } else {
-                    for target in &placements {
-                        if let Some(panel) = self.panels.get_mut(&target.surface) {
-                            panel.logical_pos = [target.x, target.y];
-                        }
-                    }
                 }
             }
             Err(err) => {
@@ -857,6 +866,7 @@ impl Worker {
 
     fn handle_event(&mut self, event: CompositorEvent) {
         match event {
+            CompositorEvent::MonitorLayoutChanged => self.broadcast_state(),
             CompositorEvent::WindowOpened => self.broadcast_targets(),
             CompositorEvent::WindowClosed { address } => {
                 let norm = normalize_window_address(&address);
@@ -977,6 +987,7 @@ fn run_worker(
         panels: BTreeMap::new(),
         next_slot: 0,
         next_fit_poll: std::time::Instant::now(),
+        last_fit_layout: Vec::new(),
         next_resize_serial: 1,
     };
     worker.broadcast_state();
@@ -1174,6 +1185,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let surface_id = created_surface.expect("virtual panel created and streamed");
+
+        let before = backend.list_monitors().unwrap();
+        let panel_before = before.iter().find(|m| m.name == "FRAME-V1").unwrap();
+        manager_ref.send(Command::SyncLayout {
+            logical_sizes: vec![(surface_id, [1280, 720])],
+            placements: vec![PanelLayoutTarget {
+                surface: surface_id,
+                x: anchor.logical_pos.0,
+                y: anchor.logical_pos.1,
+            }],
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(events_ref).messages.iter().any(|msg| {
+            matches!(msg, HostMessage::Error(err) if err.contains("would overlap"))
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "expected the overlapping layout to be rejected"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let after = backend.list_monitors().unwrap();
+        let panel_after = after.iter().find(|m| m.name == "FRAME-V1").unwrap();
+        assert_eq!(panel_before.logical_pos, panel_after.logical_pos);
 
         manager_ref.send(Command::SyncLayout {
             logical_sizes: vec![(surface_id, [1280, 720])],

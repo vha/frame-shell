@@ -210,7 +210,10 @@ pub fn receive(source: u32, data: &[u8]) {
             pc.pending_resize_frames
                 .retain(|surface, _| virtual_state.panels.iter().any(|p| p.surface == *surface));
             if pc.virtual_state.as_ref() != Some(&virtual_state) {
-                if pc.virtual_state.as_ref().map(|old| &old.panels) != Some(&virtual_state.panels) {
+                if pc.virtual_state.as_ref().is_none_or(|old| {
+                    old.panels != virtual_state.panels
+                        || old.physical_monitors != virtual_state.physical_monitors
+                }) {
                     crate::frame_shell::mark_virtual_layout_dirty();
                 }
                 pc.virtual_state = Some(virtual_state);

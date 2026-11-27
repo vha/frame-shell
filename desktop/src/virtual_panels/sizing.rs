@@ -22,6 +22,7 @@ pub(super) struct FitWindow {
     pub status: Option<String>,
     observed: Option<([u32; 2], Instant)>,
     attempted: Option<[u32; 2]>,
+    last_attempt_failed: bool,
     settle_until: Option<Instant>,
 }
 
@@ -32,8 +33,38 @@ impl Default for FitWindow {
             status: None,
             observed: None,
             attempted: None,
+            last_attempt_failed: false,
             settle_until: None,
         }
+    }
+}
+
+impl FitWindow {
+    fn ready(&mut self, size: [u32; 2], now: Instant, output_size: [u32; 2]) -> bool {
+        if let Some(deadline) = self.settle_until {
+            if now < deadline {
+                return false;
+            }
+            self.settle_until = None;
+            if self.attempted != Some(size) {
+                // The app or compositor may constrain the window after a mode set.
+                // Avoid a resize loop and let the next size change rearm fitting.
+                self.observed = Some((size, now));
+                self.attempted = Some(size);
+                self.status =
+                    Some("The app changed size after fitting. Resize the window to retry.".into());
+            }
+            return false;
+        }
+        if self.observed.is_none_or(|(old, _)| old != size)
+            || (self.attempted == Some(size) && self.status.is_none() && size != output_size)
+        {
+            self.observed = Some((size, now));
+            self.attempted = None;
+            self.last_attempt_failed = false;
+        }
+        self.attempted != Some(size)
+            && now.duration_since(self.observed.expect("observed window size").1) >= FIT_DEBOUNCE
     }
 }
 
@@ -124,6 +155,24 @@ impl Worker {
         ) else {
             return;
         };
+        let layout_changed = monitors.len() != self.last_fit_layout.len()
+            || monitors.iter().any(|m| {
+                !self.last_fit_layout.iter().any(|previous| {
+                    previous.name == m.name && Rect::from(previous) == Rect::from(m)
+                })
+            });
+        if layout_changed {
+            self.last_fit_layout.clone_from(&monitors);
+            for fit in self
+                .panels
+                .values_mut()
+                .filter_map(|panel| panel.fit.as_mut())
+            {
+                if fit.last_attempt_failed {
+                    fit.observed = None;
+                }
+            }
+        }
         let mut publish = false;
         for id in active {
             let panel = &mut self.panels.get_mut(&id).expect("active fit panel");
@@ -151,10 +200,12 @@ impl Worker {
                     && !window.pinned
                     && monitor.scale == 1.0)
                     .then(|| fitted_size(window, monitor, border))
-                    .map(|size| (size, window))
+                    .map(|size| (size, window, [monitor.width, monitor.height]))
             });
-            let (size, window) = match proposal {
-                Some((size, window)) if valid_size(size) => (size, window),
+            let (size, window, output_size) = match proposal {
+                Some((size, window, output_size)) if valid_size(size) => {
+                    (size, window, output_size)
+                }
                 other => {
                     let reason = if other.is_some() {
                         SIZE_REQUIREMENTS
@@ -167,31 +218,13 @@ impl Worker {
                     }
                     fit.observed = None;
                     fit.attempted = None;
+                    fit.settle_until = None;
                     continue;
                 }
             };
-            if let Some(deadline) = fit.settle_until {
-                if now < deadline {
-                    continue;
-                }
-                fit.settle_until = None;
-                if fit.attempted != Some(size) {
-                    fit.enabled = false;
-                    fit.status = Some(
-                        "The app changed size after fitting. Switched to fixed resolution.".into(),
-                    );
-                    publish = true;
-                }
-                continue;
-            }
-            if fit.observed.is_none_or(|(old, _)| old != size) {
-                fit.observed = Some((size, now));
-                fit.attempted = None;
-                continue;
-            }
-            if fit.attempted == Some(size)
-                || now.duration_since(fit.observed.expect("observed window size").1) < FIT_DEBOUNCE
-            {
+            let was_settling = fit.settle_until.is_some();
+            if !fit.ready(size, now, output_size) {
+                publish |= was_settling && fit.settle_until.is_none() && fit.status.is_some();
                 continue;
             }
             fit.attempted = Some(size);
@@ -199,6 +232,7 @@ impl Worker {
             let result = self.resize_panel(id, size, Some((&window_before, border)));
             if let Some(fit) = self.panels.get_mut(&id).and_then(|p| p.fit.as_mut()) {
                 fit.status = result.as_ref().err().map(|err| format!("{err:#}"));
+                fit.last_attempt_failed = result.is_err();
                 if result.is_ok() {
                     fit.settle_until = Some(Instant::now() + FIT_DEBOUNCE);
                 }
@@ -296,6 +330,7 @@ impl Worker {
             ensure!(
                 [monitor.width, monitor.height] == size
                     && monitor.logical_pos == position
+                    && layout_has_no_virtual_overlaps(&confirmed, &[])
                     && monitors.iter().zip(&positions).all(|(prev, &pos)| {
                         prev.logical_pos == pos
                             || confirmed
@@ -442,12 +477,52 @@ fn recenter(
     Ok(pos)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Rect {
     x: i32,
     y: i32,
     w: i32,
     h: i32,
+}
+
+impl From<&MonitorGeometry> for Rect {
+    fn from(monitor: &MonitorGeometry) -> Self {
+        Self {
+            x: monitor.logical_pos.0,
+            y: monitor.logical_pos.1,
+            w: monitor.logical_size.0,
+            h: monitor.logical_size.1,
+        }
+    }
+}
+
+pub(super) fn layout_has_no_virtual_overlaps(
+    monitors: &[MonitorGeometry],
+    updates: &[OutputConfigUpdate],
+) -> bool {
+    let rects: Vec<_> = monitors
+        .iter()
+        .map(|monitor| {
+            let mut rect = Rect::from(monitor);
+            if let Some((x, y)) = updates
+                .iter()
+                .find(|update| update.name == monitor.name)
+                .and_then(|update| update.pos)
+            {
+                rect.x = x;
+                rect.y = y;
+            }
+            (rect, is_virtual_output_name(&monitor.name))
+        })
+        .collect();
+    rects
+        .iter()
+        .enumerate()
+        .all(|(i, &(rect, virtual_output))| {
+            rects[i + 1..].iter().all(|&(other, other_virtual)| {
+                !(virtual_output || other_virtual) || !rect.overlaps(other)
+            })
+        })
 }
 
 impl Rect {
@@ -496,15 +571,7 @@ fn resize_layout(
         .iter()
         .map(|m| !is_virtual_output_name(&m.name))
         .collect();
-    let rects: Vec<_> = monitors
-        .iter()
-        .map(|m| Rect {
-            x: m.logical_pos.0,
-            y: m.logical_pos.1,
-            w: m.logical_size.0,
-            h: m.logical_size.1,
-        })
-        .collect();
+    let rects: Vec<_> = monitors.iter().map(Rect::from).collect();
     let old = rects[target];
     let connected = reachable(&rects, &physical);
     let scale = monitors[target].scale;
@@ -669,5 +736,41 @@ mod tests {
             monitor("HDMI-A-1", (1280, 0), (1440, 960), 1.0),
         ];
         assert!(resize_layout(&monitors, 1, [1600, 900]).is_none());
+    }
+
+    #[test]
+    fn layout_sync_checks_panels_left_out_of_the_request() {
+        let monitors = [
+            monitor("DP-1", (-1440, 0), (1440, 900), 1.5),
+            monitor("FRAME-V1", (0, 0), (1280, 720), 1.0),
+            monitor("FRAME-V2", (1280, 0), (960, 720), 1.0),
+        ];
+        let mut updates = [OutputConfigUpdate {
+            name: "FRAME-V1".into(),
+            mode: None,
+            pos: Some((500, 0)),
+            scale: None,
+        }];
+        assert!(!layout_has_no_virtual_overlaps(&monitors, &updates));
+        updates[0].pos = Some((0, 720));
+        assert!(layout_has_no_virtual_overlaps(&monitors, &updates));
+    }
+
+    #[test]
+    fn fitting_rearms_after_a_constrained_window_changes_size() {
+        let now = Instant::now();
+        let applied = [1280, 720];
+        let constrained = [1240, 720];
+        let next = [1400, 800];
+        let mut fit = FitWindow {
+            attempted: Some(applied),
+            settle_until: Some(now),
+            ..FitWindow::default()
+        };
+        assert!(!fit.ready(constrained, now, applied));
+        assert!(fit.enabled);
+        assert!(!fit.ready(constrained, now + FIT_DEBOUNCE, applied));
+        assert!(!fit.ready(next, now + FIT_DEBOUNCE, applied));
+        assert!(fit.ready(next, now + 2 * FIT_DEBOUNCE, applied));
     }
 }

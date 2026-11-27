@@ -64,6 +64,7 @@ pub struct WorkspaceInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositorEvent {
+    MonitorLayoutChanged,
     WindowOpened,
     WindowClosed {
         address: String,
