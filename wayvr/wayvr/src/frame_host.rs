@@ -13,6 +13,7 @@ use wayvr_ipc::{
         ShellMessage, VirtualState, VirtualTargets,
     },
     packet_client::PacketClient,
+    virtual_panel::DetachPlacement,
 };
 
 /// A wayvr-ipc client on a PC (source), tunnelled to the IPC server
@@ -37,6 +38,8 @@ struct Pc {
     virtual_state: Option<VirtualState>,
     virtual_targets: Option<VirtualTargets>,
     pending_resize_frames: BTreeMap<u32, ([u32; 2], u64)>,
+    detach_preview: Option<DetachPlacement>,
+    detached_panels: BTreeMap<u32, DetachPlacement>,
 }
 
 struct State {
@@ -118,6 +121,8 @@ pub fn connected(source: u32, _background: bool) {
             virtual_state: None,
             virtual_targets: None,
             pending_resize_frames: BTreeMap::new(),
+            detach_preview: None,
+            detached_panels: BTreeMap::new(),
         },
     );
     drop(state);
@@ -265,6 +270,20 @@ pub fn receive(source: u32, data: &[u8]) {
                     output_size,
                 });
             }
+        }
+        HostMessage::DetachPreview(preview) => {
+            if pc.detach_preview.is_none() && preview.is_some() && state.errors.len() < 8 {
+                state.errors.push_back("Drop to create panel".into());
+            }
+            pc.detach_preview = preview;
+        }
+        HostMessage::DetachedPanel { surface, placement } => {
+            if pc.detached_panels.len() >= 8
+                && let Some(first) = pc.detached_panels.keys().next().copied()
+            {
+                pc.detached_panels.remove(&first);
+            }
+            pc.detached_panels.insert(surface, placement);
         }
     }
     drop(guard);
@@ -455,6 +474,21 @@ pub struct WindowMove {
 
 pub fn take_window_moves() -> Vec<WindowMove> {
     std::mem::take(&mut state().window_moves)
+}
+
+pub fn detach_preview() -> Option<(u32, DetachPlacement)> {
+    state()
+        .pcs
+        .iter()
+        .find_map(|(&source, pc)| pc.detach_preview.clone().map(|preview| (source, preview)))
+}
+
+pub fn take_detach_placement(source: u32, surface: u32) -> Option<DetachPlacement> {
+    state()
+        .pcs
+        .get_mut(&source)?
+        .detached_panels
+        .remove(&surface)
 }
 
 pub fn take_notifications() -> Vec<Notification> {

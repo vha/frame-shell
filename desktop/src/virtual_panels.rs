@@ -1,5 +1,6 @@
 //! Virtual headless panel lifecycle manager for interactive VR desktop panels.
 
+mod detach;
 mod sizing;
 mod window_follow;
 
@@ -11,7 +12,7 @@ use crate::{
     },
     wayland_capture,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -31,6 +32,7 @@ use wayvr_ipc::frame::{
 pub enum Command {
     RequestState,
     RefreshTargets,
+    Detach(wayvr_ipc::virtual_panel::DetachGesture),
     Create {
         source: VirtualTargetKind,
         size: [u32; 2],
@@ -206,6 +208,9 @@ struct Worker {
     panels: BTreeMap<u32, ActivePanel>,
     next_slot: u32,
     next_fit_poll: std::time::Instant,
+    detach: Option<detach::Gesture>,
+    last_detach_release: u64,
+    next_detach_poll: std::time::Instant,
     last_fit_layout: Vec<MonitorGeometry>,
     next_resize_serial: u64,
 }
@@ -341,6 +346,15 @@ impl Worker {
     }
 
     fn handle_create(&mut self, source: VirtualTargetKind, size: [u32; 2]) {
+        self.create_panel(source, size, None);
+    }
+
+    fn create_panel(
+        &mut self,
+        source: VirtualTargetKind,
+        size: [u32; 2],
+        detach: Option<detach::Creation>,
+    ) {
         let Some(backend) = self.backend.clone() else {
             self.output.send(&HostMessage::Error(
                 self.capabilities
@@ -380,8 +394,9 @@ impl Worker {
         }
 
         let Some(surface) = virtual_surface_id(self.next_slot) else {
-            self.output
-                .send(&HostMessage::Error("Virtual surface ID limit reached".into()));
+            self.output.send(&HostMessage::Error(
+                "Virtual surface ID limit reached".into(),
+            ));
             return;
         };
         self.next_slot += 1;
@@ -396,8 +411,8 @@ impl Worker {
 
         let attempt = (|| -> Result<ActivePanel> {
             let monitors = backend.list_monitors()?;
-            let primary_phys = pick_primary_physical(&monitors)
-                .context("No physical monitor available")?;
+            let primary_phys =
+                pick_primary_physical(&monitors).context("No physical monitor available")?;
             let primary_phys_name = primary_phys.name.clone();
             let primary_phys_ws = primary_phys.active_workspace_id.max(1);
             let spawn_x = monitors
@@ -405,14 +420,14 @@ impl Worker {
                 .map(|m| m.logical_pos.0 + m.logical_size.0)
                 .max()
                 .unwrap_or(0);
-            let spawn_y = primary_phys.logical_pos.1;
+            let (spawn_x, spawn_y) = detach
+                .as_ref()
+                .map_or((spawn_x, primary_phys.logical_pos.1), |drop| drop.position);
 
             let (title, ownership) = match &source {
                 VirtualTargetKind::Blank { .. } => (
                     output_name.clone(),
-                    PanelOwnership::Blank {
-                        workspace_id: -1,
-                    },
+                    PanelOwnership::Blank { workspace_id: -1 },
                 ),
                 VirtualTargetKind::Window { address, .. } => {
                     let norm = normalize_window_address(address);
@@ -421,14 +436,18 @@ impl Worker {
                         .into_iter()
                         .find(|w| w.address == norm)
                         .context("Selected window is no longer open")?;
-                    let return_monitor = if capture::is_virtual_output_name(&win.monitor_name)
+                    let return_monitor = if let Some(drop) = &detach {
+                        drop.window.monitor_name.clone()
+                    } else if capture::is_virtual_output_name(&win.monitor_name)
                         || win.monitor_name.is_empty()
                     {
                         primary_phys_name.clone()
                     } else {
                         win.monitor_name.clone()
                     };
-                    let return_ws = if capture::is_virtual_output_name(&win.monitor_name) {
+                    let return_ws = if let Some(drop) = &detach {
+                        drop.window.workspace_id
+                    } else if capture::is_virtual_output_name(&win.monitor_name) {
                         primary_phys_ws
                     } else {
                         win.workspace_id.max(1)
@@ -498,7 +517,7 @@ impl Worker {
 
             backend.create_headless_output(&output_name)?;
             let setup_res = (|| -> Result<PanelOwnership> {
-                let mut config_updates = pin_updates;
+                let mut config_updates = pin_updates.clone();
                 config_updates.push(OutputConfigUpdate {
                     name: output_name.clone(),
                     mode: Some((width, height, 60)),
@@ -513,6 +532,14 @@ impl Worker {
                     .find(|m| m.name == output_name)
                     .with_context(|| format!("Created output {output_name} missing"))?;
                 let default_ws_id = vmon.active_workspace_id.max(1);
+                if detach.is_some() {
+                    ensure!(
+                        [vmon.width, vmon.height] == [width, height]
+                            && vmon.logical_pos == (spawn_x, spawn_y)
+                            && sizing::layout_has_no_virtual_overlaps(&monitors_after, &[]),
+                        "The compositor did not confirm a usable drop position"
+                    );
+                }
 
                 match ownership {
                     PanelOwnership::Blank { .. } => Ok(PanelOwnership::Blank {
@@ -527,6 +554,25 @@ impl Worker {
                         ..
                     } => {
                         backend.move_window_to_workspace(&address, &default_ws_id.to_string())?;
+                        if let Some(drop) = &detach {
+                            let pos = sizing::recenter(
+                                backend.as_ref(),
+                                vmon,
+                                &drop.window,
+                                drop.border,
+                            )?;
+                            preserve_cursor(
+                                backend.as_ref(),
+                                vmon,
+                                drop.cursor,
+                                drop.window.pos,
+                                pos,
+                            );
+                            self.output.send(&HostMessage::DetachedPanel {
+                                surface,
+                                placement: drop.placement.clone(),
+                            });
+                        }
                         Ok(PanelOwnership::Window {
                             address,
                             title,
@@ -554,7 +600,17 @@ impl Worker {
             let ownership = match setup_res {
                 Ok(own) => own,
                 Err(err) => {
+                    if let Some(drop) = &detach {
+                        let _ = backend.move_window_to_workspace(
+                            &drop.window.address,
+                            &drop.window.workspace_id.to_string(),
+                        );
+                        let _ = backend.move_floating_window(&drop.window.address, drop.window.pos);
+                    }
                     let _ = backend.remove_output(&output_name);
+                    if detach.is_some() {
+                        let _ = backend.configure_outputs(&pin_updates);
+                    }
                     return Err(err);
                 }
             };
@@ -567,7 +623,13 @@ impl Worker {
                 .find(|m| m.name == output_name)
                 .cloned();
             let (actual_w, actual_h, pos, logical_size, scale) = vmon.map_or(
-                (width, height, [spawn_x, spawn_y], [width as i32, height as i32], 1.0),
+                (
+                    width,
+                    height,
+                    [spawn_x, spawn_y],
+                    [width as i32, height as i32],
+                    1.0,
+                ),
                 |m| {
                     (
                         m.width,
@@ -581,7 +643,22 @@ impl Worker {
 
             self.shared.register_stream(surface, output_name.clone());
             let cancel = Arc::new(AtomicBool::new(false));
-            let capture_thread = self.start_capture(surface, &output_name, cancel.clone())?;
+            let capture_thread = match self.start_capture(surface, &output_name, cancel.clone()) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    self.shared.unregister_stream(surface);
+                    if let Some(drop) = &detach {
+                        let _ = backend.move_window_to_workspace(
+                            &drop.window.address,
+                            &drop.window.workspace_id.to_string(),
+                        );
+                        let _ = backend.move_floating_window(&drop.window.address, drop.window.pos);
+                        let _ = backend.remove_output(&output_name);
+                        let _ = backend.configure_outputs(&pin_updates);
+                    }
+                    return Err(error);
+                }
+            };
             let fit =
                 matches!(ownership, PanelOwnership::Window { .. }).then(sizing::FitWindow::default);
 
@@ -608,6 +685,32 @@ impl Worker {
                     panel.output_name, panel.width, panel.height, panel.logical_pos
                 );
                 self.panels.insert(surface, panel);
+                if let Some(drop) = &detach {
+                    self.broadcast_state();
+                    let serial =
+                        self.shared
+                            .virtual_resize_ack
+                            .load(Ordering::Acquire)
+                            .then(|| {
+                                let serial = self.next_resize_serial;
+                                self.next_resize_serial += 1;
+                                self.output.send(&HostMessage::VerifyVirtualResize {
+                                    surface,
+                                    size,
+                                    serial,
+                                });
+                                crate::lock(&self.shared.keyframes).insert(surface);
+                                serial
+                            });
+                    if let Err(error) = self.wait_for_frame(surface, size, serial) {
+                        self.close_panel(surface, true, true);
+                        let _ = backend.move_floating_window(&drop.window.address, drop.window.pos);
+                        self.output.send(&HostMessage::Error(format!(
+                            "Could not stream the detached window: {error:#}"
+                        )));
+                        return;
+                    }
+                }
                 self.broadcast_state();
                 self.broadcast_targets();
             }
@@ -686,7 +789,7 @@ impl Worker {
             } => {
                 let target_ws = if restore_owned {
                     let return_mon_exists = monitors.iter().any(|m| {
-                        !capture::is_virtual_output_name(&m.name) && m.name == *return_monitor
+                        m.name != panel.output_name && m.name == *return_monitor
                     });
                     if return_mon_exists {
                         *return_workspace_id
@@ -992,6 +1095,9 @@ fn run_worker(
         panels: BTreeMap::new(),
         next_slot: 0,
         next_fit_poll: std::time::Instant::now(),
+        detach: None,
+        last_detach_release: 0,
+        next_detach_poll: std::time::Instant::now(),
         last_fit_layout: Vec::new(),
         next_resize_serial: 1,
     };
@@ -999,10 +1105,14 @@ fn run_worker(
 
     let mut next_command = None;
     loop {
+        worker.poll_detach();
         worker.poll_window_fit();
+        let wait = if worker.detach.is_some() {
+            worker.fit_poll_delay().min(detach::POLL_INTERVAL)
+        } else { worker.fit_poll_delay() };
         let cmd = match next_command
             .take()
-            .map_or_else(|| rx.recv_timeout(worker.fit_poll_delay()), Ok)
+            .map_or_else(|| rx.recv_timeout(wait), Ok)
         {
             Ok(cmd) => cmd,
             Err(mpsc::RecvTimeoutError::Timeout) if !worker.output.stopped() => continue,
@@ -1017,6 +1127,7 @@ fn run_worker(
                 worker.broadcast_targets();
             }
             Command::RefreshTargets => worker.broadcast_targets(),
+            Command::Detach(gesture) => worker.detach_gesture(gesture),
             Command::Create { source, size } => worker.handle_create(source, size),
             Command::Close { surface } => worker.close_panel(surface, true, true),
             Command::Focus { surface } => worker.focus_panel(surface),
@@ -1347,6 +1458,178 @@ mod tests {
         }
         assert!(closed, "expected virtual panel close and removal");
 
+        if std::env::var_os("FRAME_TEST_DETACH").is_some() {
+            use wayvr_ipc::virtual_panel::{DetachGesture, DropEdge};
+            let mut terminal = std::process::Command::new("alacritty")
+                .args([
+                    "--class",
+                    "frame-detach-test",
+                    "--config-file",
+                    "/dev/null",
+                    "-e",
+                    "sleep",
+                    "25",
+                ])
+                .spawn()
+                .expect("detach test window");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let original = loop {
+                if let Some(w) = backend
+                    .list_windows()
+                    .unwrap()
+                    .into_iter()
+                    .find(|w| w.app_id == "frame-detach-test")
+                {
+                    break w;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "detach test window never appeared"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            let address = &original.address;
+            for command in [
+                format!("hl.dsp.window.float({{ window = 'address:{address}', action = 'set' }})"),
+                format!(
+                    "hl.dsp.window.resize({{ window = 'address:{address}', x = 800, y = 520, relative = false }})"
+                ),
+            ] {
+                let reply = std::process::Command::new("hyprctl")
+                    .args(["dispatch", &command])
+                    .output()
+                    .unwrap();
+                assert_eq!(String::from_utf8_lossy(&reply.stdout).trim(), "ok");
+            }
+            let (x, y) = anchor.logical_pos;
+            let start = [x + 160, y + 100];
+            let edge = [x + 1, y + 100];
+            for id in [1, 2, 3] {
+                backend
+                    .move_floating_window(address, [x + 100, y + 40])
+                    .unwrap();
+                backend.move_cursor(start).unwrap();
+                manager_ref.send(Command::Detach(DetachGesture::Begin {
+                    id,
+                    address: address.clone(),
+                    cursor: start,
+                }));
+                std::thread::sleep(Duration::from_millis(200));
+                backend
+                    .move_floating_window(address, [x - 50, y + 40])
+                    .unwrap();
+                backend.move_cursor(edge).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let preview = loop {
+                    let events = lock(events_ref);
+                    let latest = events.messages.iter().rev().find_map(|event| match event {
+                        HostMessage::DetachPreview(preview) => Some(preview.clone()),
+                        _ => None,
+                    });
+                    if let Some(Some(preview)) = latest {
+                        break preview;
+                    }
+                    assert!(Instant::now() < deadline, "detach preview never armed");
+                    drop(events);
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                assert_eq!(preview.edge, DropEdge::Left);
+                assert_eq!(
+                    backend.list_monitors().unwrap().len(),
+                    1,
+                    "holding at the edge must not detach"
+                );
+                if id == 1 {
+                    backend.move_cursor(start).unwrap();
+                    manager_ref.send(Command::Detach(DetachGesture::Release {
+                        id,
+                        cursor: start,
+                    }));
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !matches!(
+                        lock(events_ref)
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|event| matches!(event, HostMessage::DetachPreview(_))),
+                        Some(HostMessage::DetachPreview(None))
+                    ) {
+                        assert!(Instant::now() < deadline, "detach did not cancel");
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    assert_eq!(backend.list_monitors().unwrap().len(), 1);
+                    continue;
+                }
+                shared.virtual_resize_ack.store(id == 3, Ordering::Release);
+                manager_ref.send(Command::Detach(DetachGesture::Release { id, cursor: edge }));
+                if id == 3 {
+                    let deadline = Instant::now() + Duration::from_secs(6);
+                    while !lock(events_ref).messages.iter().any(|event| {
+                        matches!(event, HostMessage::Error(error) if error.contains("Could not stream the detached window"))
+                    }) {
+                        assert!(Instant::now() < deadline, "detach did not roll back when the headset failed to confirm the first frame");
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    assert_eq!(backend.list_monitors().unwrap().len(), 1);
+                    let returned = backend
+                        .list_windows()
+                        .unwrap()
+                        .into_iter()
+                        .find(|window| &window.address == address)
+                        .unwrap();
+                    assert_eq!(returned.workspace_id, original.workspace_id);
+                    assert_eq!(returned.monitor_name, original.monitor_name);
+                    continue;
+                }
+                let deadline = Instant::now() + Duration::from_secs(6);
+                let surface = loop {
+                    let events = lock(events_ref);
+                    if let Some(surface) =
+                        events.messages.iter().rev().find_map(|event| match event {
+                            HostMessage::DetachedPanel { surface, placement }
+                                if placement == &preview && events.videos.contains(surface) =>
+                            {
+                                Some(*surface)
+                            }
+                            _ => None,
+                        })
+                    {
+                        break surface;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "detached output did not start: {:?}",
+                        events
+                            .messages
+                            .iter()
+                            .filter_map(|event| match event {
+                                HostMessage::Error(error) => Some(error),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                    drop(events);
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                let monitors = backend.list_monitors().unwrap();
+                let detached = monitors
+                    .iter()
+                    .find(|m| capture::is_virtual_output_name(&m.name))
+                    .unwrap();
+                assert_eq!([detached.width, detached.height], preview.size);
+                assert_eq!(detached.logical_pos.0 + detached.logical_size.0, x);
+                manager_ref.send(Command::Close { surface });
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !lock(events_ref).removed.contains(&surface) {
+                    assert!(Instant::now() < deadline, "detached output did not close");
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            let _ = terminal.kill();
+            let _ = terminal.wait();
+            return;
+        }
+
         if std::env::var_os("FRAME_TEST_WINDOW_FIT").is_some() {
             let output = std::process::Command::new("alacritty")
                 .args([
@@ -1382,6 +1665,7 @@ mod tests {
                 assert!(Instant::now() < deadline, "test window never mapped");
                 std::thread::sleep(Duration::from_millis(25));
             };
+            let last_surface = lock(events_ref).surfaces.iter().copied().max().unwrap();
             manager_ref.send(Command::Create {
                 source: VirtualTargetKind::Window {
                     address: window.address.clone(),
@@ -1401,7 +1685,7 @@ mod tests {
                         HostMessage::VirtualState(state) => state.panels.first().cloned(),
                         _ => None,
                     })
-                    .filter(|p| p.surface != surface_id && events.videos.contains(&p.surface))
+                    .filter(|p| p.surface > last_surface && events.videos.contains(&p.surface))
                 {
                     break panel;
                 }

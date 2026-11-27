@@ -59,6 +59,14 @@ pub(crate) fn handle_request<T: Default>(
             super::drag_edit::finish(app, overlays, connection, commit)?;
             return Ok(Response::Accepted);
         }
+        Request::Detach(ref gesture) => {
+            let source = app.ipc_server.remote_source(connection).ok_or("Use this command on the PC running Hyprland.")?;
+            if !frame_host::virtual_state(source).is_some_and(|state| state.capabilities.detach_panel) {
+                return Err("This PC server does not support drag-to-detach.".into());
+            }
+            return frame_host::send(source, &ShellMessage::VirtualDetach(gesture.clone()))
+                .then_some(Response::Accepted).ok_or_else(|| "The PC disconnected.".into());
+        }
         Request::BeginDrag { source, .. } => source,
         Request::Refresh { source }
         | Request::Create { source, .. }
@@ -79,6 +87,7 @@ pub(crate) fn handle_request<T: Default>(
         Request::List
         | Request::BeginDragAtOutput { .. }
         | Request::DragMotion { .. }
+        | Request::Detach(_)
         | Request::EndDrag { .. } => unreachable!(),
         Request::BeginDrag { surface, .. } => {
             let info = state

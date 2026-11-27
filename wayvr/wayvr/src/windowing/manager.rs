@@ -1148,6 +1148,16 @@ impl<T> OverlayWindowManager<T> {
             SpawnPos::Parent(parent) => {
                 let _ = self.offset_spawn_from_parent(app, oid, &parent);
             }
+            SpawnPos::Detached(source, placement) => {
+                let (pose, _) = crate::frame_shell::detach_pose(app, self, source, &placement);
+                let config = &mut self.overlays[oid].config;
+                if let Some(state) = config.active_state.as_mut() {
+                    state.transform = pose;
+                    save_transform(state, app);
+                }
+                config.dirty = true;
+                crate::frame_shell::layout_changed();
+            }
         }
     }
 

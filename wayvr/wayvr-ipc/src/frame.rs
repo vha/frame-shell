@@ -60,6 +60,11 @@ pub enum HostMessage {
 		delta: [i32; 2],
 		output_size: [u32; 2],
 	},
+	DetachPreview(Option<crate::virtual_panel::DetachPlacement>),
+	DetachedPanel {
+		surface: u32,
+		placement: crate::virtual_panel::DetachPlacement,
+	},
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -132,6 +137,7 @@ pub enum ShellMessage {
 	},
 	EnableVirtualResizeAck,
 	EnableVirtualWindowFollow,
+	VirtualDetach(crate::virtual_panel::DetachGesture),
 	VirtualResizeDecoded {
 		surface: u32,
 		serial: u64,
@@ -146,6 +152,8 @@ pub struct VirtualCapabilities {
 	pub resize_panel: bool,
 	#[serde(default)]
 	pub window_follow: bool,
+	#[serde(default)]
+	pub detach_panel: bool,
 	pub supported: bool,
 	pub compositor: String,
 	pub reason: Option<String>,
@@ -353,6 +361,7 @@ mod tests {
 		let state = HostMessage::VirtualState(VirtualState {
 			capabilities: VirtualCapabilities {
 				window_follow: true,
+				detach_panel: true,
 				focus_panel: true,
 				resize_panel: true,
 				supported: true,

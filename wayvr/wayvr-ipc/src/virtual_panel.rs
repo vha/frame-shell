@@ -52,11 +52,42 @@ pub enum Request {
 	EndDrag {
 		commit: bool,
 	},
+	Detach(DetachGesture),
 	Control {
 		source: u32,
 		surface: u32,
 		action: Action,
 	},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DetachGesture {
+	Begin {
+		id: u64,
+		address: String,
+		cursor: [i32; 2],
+	},
+	Release {
+		id: u64,
+		cursor: [i32; 2],
+	},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DropEdge {
+	Left,
+	Right,
+	Top,
+	Bottom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachPlacement {
+	pub anchor: String,
+	pub anchor_size: [i32; 2],
+	pub edge: DropEdge,
+	pub offset: i32,
+	pub size: [u32; 2],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

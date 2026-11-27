@@ -367,6 +367,9 @@ impl Host {
             ShellMessage::EnableVirtualWindowFollow => {
                 self.shared.virtual_window_follow.store(true, Ordering::Release);
             }
+            ShellMessage::VirtualDetach(gesture) => {
+                self.virtuals.send(virtual_panels::Command::Detach(gesture));
+            }
             ShellMessage::VirtualResizeDecoded { surface, serial } => {
                 let mut ack = lock(&self.shared.decoded_virtual_resize);
                 if ack.is_none_or(|(_, previous)| previous < serial) {

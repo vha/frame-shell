@@ -537,7 +537,7 @@ impl Worker {
         Ok(())
     }
 
-    fn wait_for_frame(
+    pub(super) fn wait_for_frame(
         &self,
         surface: u32,
         [width, height]: [u32; 2],
@@ -573,7 +573,7 @@ fn capture_finished(panel: &ActivePanel) -> bool {
         .is_none_or(|thread| thread.is_finished())
 }
 
-fn fitted_size(window: &WindowInfo, monitor: &MonitorGeometry, border: u32) -> [u32; 2] {
+pub(super) fn fitted_size(window: &WindowInfo, monitor: &MonitorGeometry, border: u32) -> [u32; 2] {
     let reserved = monitor.reserved.map(|v| v.max(0) as u32);
     std::array::from_fn(|axis| {
         let outer = window.size[axis]
@@ -584,7 +584,7 @@ fn fitted_size(window: &WindowInfo, monitor: &MonitorGeometry, border: u32) -> [
     })
 }
 
-fn recenter(
+pub(super) fn recenter(
     backend: &dyn crate::compositor::CompositorBackend,
     monitor: &MonitorGeometry,
     window: &WindowInfo,

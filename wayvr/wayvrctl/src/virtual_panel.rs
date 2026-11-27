@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use wayvr_ipc::{
     client::WayVRClient,
     virtual_panel::{
-        Action, DEFAULT_SIZE, Direction, HostPanels, Request, Response, SIZE_REQUIREMENTS, Sizing,
+        Action, DEFAULT_SIZE, DetachGesture, Direction, HostPanels, Request, Response, SIZE_REQUIREMENTS, Sizing,
         Target, valid_size,
     },
 };
@@ -29,6 +29,11 @@ pub enum CommandLine {
     Refresh { pc: u32 },
     /// Choose a PC, panel or share target in an interactive terminal picker
     Pick,
+    /// Forward the existing Hyprland move gesture to Frame Shell
+    Detach {
+        #[command(subcommand)]
+        gesture: DetachCommand,
+    },
     /// Arm mouse drag for the panel under the PC cursor, or an explicitly selected panel
     Drag {
         #[arg(long, requires = "surface")]
@@ -78,6 +83,25 @@ pub enum CommandLine {
         direction: NudgeDirection,
         #[arg(long)]
         fine: bool,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum DetachCommand {
+    Begin {
+        id: u64,
+        address: String,
+        #[arg(allow_hyphen_values = true)]
+        x: i32,
+        #[arg(allow_hyphen_values = true)]
+        y: i32,
+    },
+    Release {
+        id: u64,
+        #[arg(allow_hyphen_values = true)]
+        x: i32,
+        #[arg(allow_hyphen_values = true)]
+        y: i32,
     },
 }
 
@@ -237,6 +261,10 @@ pub async fn run(state: &mut WayVRClientState, command: CommandLine) -> Result<(
             return drag(state, pc.zip(surface), gain).await;
         }
         CommandLine::Refresh { pc } => Request::Refresh { source: pc },
+        CommandLine::Detach { gesture } => Request::Detach(match gesture {
+            DetachCommand::Begin { id, address, x, y } => DetachGesture::Begin { id, address, cursor: [x, y] },
+            DetachCommand::Release { id, x, y } => DetachGesture::Release { id, cursor: [x, y] },
+        }),
         CommandLine::Add { pc, size, target } => Request::Create {
             source: pc,
             size: match size {

@@ -129,6 +129,62 @@ pub fn clear_virtual_layout(source: u32) {
         .remove(&source);
 }
 
+pub fn detach_pose<T>(
+    app: &AppState,
+    overlays: &crate::windowing::manager::OverlayWindowManager<T>,
+    source: u32,
+    placement: &wayvr_ipc::virtual_panel::DetachPlacement,
+) -> (glam::Affine3A, glam::Vec2) {
+    use wayvr_ipc::virtual_panel::DropEdge;
+
+    let state = crate::frame_host::virtual_state(source);
+    let parent_name = state
+        .as_ref()
+        .and_then(|state| {
+            state
+                .panels
+                .iter()
+                .find(|panel| panel.output_name == placement.anchor)
+                .map(|panel| virtual_overlay_name(source, panel.surface, &panel.output_name))
+        })
+        .or_else(|| {
+            crate::frame_hosts::for_source(source)
+                .map(|pc| Arc::<str>::from(format!("{} {}", pc.id, placement.anchor)))
+        });
+    let anchor = parent_name.and_then(|name| {
+        overlays.iter().find_map(|(_, overlay)| {
+            (overlay.config.name == name)
+                .then_some(overlay.config.active_state.as_ref())
+                .flatten()
+                .map(|state| overlay.config.surface_transform(state.transform))
+        })
+    });
+    let [w, h] = placement.size.map(|dimension| dimension.max(1) as f32);
+    let mut pose = anchor.unwrap_or_else(|| {
+        app.input_state.hmd * glam::Affine3A::from_translation(glam::vec3(0.0, 0.0, -1.5))
+    });
+    let [anchor_w, anchor_h] = placement
+        .anchor_size
+        .map(|dimension| dimension.max(1) as f32);
+    let density = pose.x_axis.length().max(0.1) / anchor_w.max(anchor_h);
+    let major = (w.max(h) * density).clamp(0.3, 3.0);
+    let dimensions = glam::vec2(w, h) * (major / w.max(h));
+    let right = pose.x_axis.normalize_or_zero();
+    let up = pose.y_axis.normalize_or_zero();
+    let across = placement.offset as f32 * density;
+    let horizontal = (anchor_w * density + dimensions.x) * 0.5 + 0.04;
+    let vertical = (anchor_h * density + dimensions.y) * 0.5 + 0.04;
+    let (x, y) = match placement.edge {
+        DropEdge::Left => (-horizontal, -across),
+        DropEdge::Right => (horizontal, -across),
+        DropEdge::Top => (across, vertical),
+        DropEdge::Bottom => (across, -vertical),
+    };
+    pose.translation += right * x + up * y;
+    pose.matrix3 = glam::Mat3A::from_cols(right, up, right.cross(up)).mul_scalar(major);
+    (pose, dimensions)
+}
+
 pub fn poll_window_moves<T: Default>(
     app: &AppState,
     overlays: &mut crate::windowing::manager::OverlayWindowManager<T>,
@@ -438,9 +494,12 @@ pub fn poll_surfaces(app: &mut AppState) {
     {
         surface.spawned = run;
         let name = surface.name.clone();
+        let source = (key >> 32) as u32;
+        let spawn = crate::frame_host::take_detach_placement(source, key as u32)
+            .map_or(SpawnPos::Spread, |placement| SpawnPos::Detached(source, placement));
         app.tasks.enqueue(TaskType::Overlay(OverlayTask::Spawn(
             OverlaySelector::Name(name.clone()),
-            SpawnPos::Spread,
+            spawn,
             Box::new(move |app| Some(desktop_overlay(name, key, app))),
         )));
     }

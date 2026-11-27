@@ -160,6 +160,7 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
         lines.allocate(&xr_state, &app)?,
         lines.allocate(&xr_state, &app)?,
     ];
+    let mut detach_lines = None;
 
     let watch_id = overlays.lookup(WATCH_NAME).unwrap(); // want panic
 
@@ -437,6 +438,29 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
                 line.mode as usize + 1,
                 app.input_state.hmd,
             );
+        }
+        if let Some((source, preview)) = crate::frame_host::detach_preview() {
+            if detach_lines.is_none() {
+                detach_lines = Some([
+                    lines.allocate(&xr_state, &app)?,
+                    lines.allocate(&xr_state, &app)?,
+                    lines.allocate(&xr_state, &app)?,
+                    lines.allocate(&xr_state, &app)?,
+                ]);
+            }
+            let (pose, dimensions) =
+                crate::frame_shell::detach_pose(&app, &overlays, source, &preview);
+            let right = pose.x_axis.normalize_or_zero() * dimensions.x * 0.5;
+            let up = pose.y_axis.normalize_or_zero() * dimensions.y * 0.5;
+            let corners = [-right - up, right - up, right + up, -right + up]
+                .map(|offset| pose.translation + offset);
+            for (i, id) in detach_lines
+                .expect("detach preview lines")
+                .into_iter()
+                .enumerate()
+            {
+                lines.draw_between(id, corners[i], corners[(i + 1) % 4], 0, app.input_state.hmd);
+            }
         }
 
         app.hid_provider.inner.commit();
