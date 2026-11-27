@@ -26,7 +26,7 @@
       self = {outPath = ./wayvr;};
     };
     gstPlugins = with pkgs.gst_all_1; [gstreamer.out gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly pkgs.pipewire];
-    hostLibs = with pkgs; [dbus pipewire wayland libxkbcommon gst_all_1.gstreamer gst_all_1.gst-plugins-base];
+    hostLibs = with pkgs; [dbus pipewire wayland libxkbcommon libgbm gst_all_1.gstreamer gst_all_1.gst-plugins-base];
     # The PC host services, a static library linked into the server
     frame-host = pkgs.rustPlatform.buildRustPackage {
       pname = "frame-host";
@@ -113,6 +113,9 @@
       inputsFrom = [server wayvr.devShells.${system}.default];
       GST_PLUGIN_SYSTEM_PATH_1_0 = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" gstPlugins;
       LIBVA_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
+      shellHook = ''
+        export GBM_BACKENDS_PATH="''${GBM_BACKENDS_PATH:-${pkgs.mesa}/lib/gbm:/run/opengl-driver/lib/gbm:/usr/lib/gbm}"
+      '';
       packages = with pkgs; [cmake ninja gdb pkg-config python3 shellcheck gst_all_1.gstreamer gst_all_1.gst-plugins-base];
     };
   };

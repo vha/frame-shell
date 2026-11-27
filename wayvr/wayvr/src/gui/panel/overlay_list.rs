@@ -471,10 +471,6 @@ fn rebuild_groups(
                 .map_or_else(String::new, |s| s.to_string())
                 .into(),
         );
-        params.insert(
-            "virtual_skip",
-            if host.virtual_supported { "0" } else { "1" },
-        );
         let (action, label) = if connected {
             (
                 format!("::FrameShell disconnect {}", host.cookie),

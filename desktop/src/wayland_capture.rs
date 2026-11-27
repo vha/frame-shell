@@ -1,9 +1,13 @@
 //! Direct Wayland output capture via `ext-image-copy-capture-v1` feeding GStreamer hardware encoders.
 
+mod dmabuf;
+
 use crate::{Output, Shared, capture, lock};
 use anyhow::{Context, Result, bail};
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::{AppSink, AppSrc};
+#[cfg(test)]
+use std::sync::Arc;
 use std::{
     ffi::CString,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
@@ -11,8 +15,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-#[cfg(test)]
-use std::sync::Arc;
 use wayvr_ipc::{frame::DesktopSettings, metrics};
 use wlx_capture::libc;
 use wlx_capture::wayland_client::{
@@ -38,6 +40,8 @@ use wlx_capture::wayland_protocols::ext::{
         ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
     },
 };
+
+use wlx_capture::wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
 /// Returns true when the compositor advertises `ext_image_copy_capture_manager_v1` and
 /// `ext_output_image_capture_source_manager_v1`.
@@ -93,9 +97,11 @@ struct CaptureState {
 
     pending_size: (u32, u32),
     pending_formats: Vec<wl_shm::Format>,
+    pending_dmabuf: dmabuf::Constraints,
 
     active_size: (u32, u32),
     active_formats: Vec<wl_shm::Format>,
+    active_dmabuf: dmabuf::Constraints,
     constraints_gen: u64,
     session_stopped: bool,
     frame_status: FrameStatus,
@@ -109,8 +115,10 @@ impl CaptureState {
             output_removed: false,
             pending_size: (0, 0),
             pending_formats: Vec::new(),
+            pending_dmabuf: dmabuf::Constraints::default(),
             active_size: (0, 0),
             active_formats: Vec::new(),
+            active_dmabuf: dmabuf::Constraints::default(),
             constraints_gen: 0,
             session_stopped: false,
             frame_status: FrameStatus::Idle,
@@ -127,8 +135,10 @@ impl CaptureState {
     fn reset_session_state(&mut self) {
         self.pending_size = (0, 0);
         self.pending_formats.clear();
+        self.pending_dmabuf = dmabuf::Constraints::default();
         self.active_size = (0, 0);
         self.active_formats.clear();
+        self.active_dmabuf = dmabuf::Constraints::default();
         self.session_stopped = false;
         self.frame_status = FrameStatus::Idle;
     }
@@ -211,11 +221,21 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
             } => {
                 state.pending_formats.push(fmt);
             }
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { device } => {
+                state.pending_dmabuf.device =
+                    device.try_into().ok().map(libc::dev_t::from_ne_bytes);
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
+                let modifiers = modifiers
+                    .chunks_exact(8)
+                    .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                state.pending_dmabuf.formats.push((format, modifiers));
+            }
             ext_image_copy_capture_session_v1::Event::Done => {
                 state.active_size = state.pending_size;
-                if !state.pending_formats.is_empty() {
-                    state.active_formats = std::mem::take(&mut state.pending_formats);
-                }
+                state.active_formats = std::mem::take(&mut state.pending_formats);
+                state.active_dmabuf = std::mem::take(&mut state.pending_dmabuf);
                 state.constraints_gen = state.constraints_gen.wrapping_add(1);
             }
             ext_image_copy_capture_session_v1::Event::Stopped => {
@@ -268,6 +288,7 @@ macro_rules! noop_dispatch {
 }
 
 noop_dispatch!(
+    ZwpLinuxDmabufV1,
     WlShm,
     WlShmPool,
     WlBuffer,
@@ -279,13 +300,12 @@ noop_dispatch!(
 struct ShmFrameBuffer {
     width: u32,
     height: u32,
-    format: wl_shm::Format,
     gst_format: &'static str,
     wl_buffer: WlBuffer,
     wl_pool: WlShmPool,
     ptr: NonNull<u8>,
     byte_len: usize,
-    _fd: OwnedFd,
+    latest: Option<gst::Buffer>,
 }
 
 impl ShmFrameBuffer {
@@ -348,18 +368,35 @@ impl ShmFrameBuffer {
         Ok(Self {
             width,
             height,
-            format,
             gst_format,
             wl_buffer,
             wl_pool,
             ptr,
             byte_len,
-            _fd: fd,
+            latest: None,
         })
     }
 
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.byte_len) }
+    fn complete(&mut self) -> Result<()> {
+        let bytes = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.byte_len) };
+        let mut buffer = gst::Buffer::with_size(bytes.len())?;
+        buffer
+            .get_mut()
+            .expect("new GStreamer buffer")
+            .map_writable()?
+            .as_mut_slice()
+            .copy_from_slice(bytes);
+        self.latest = Some(buffer);
+        Ok(())
+    }
+
+    fn caps(&self) -> gst::Caps {
+        gst::Caps::builder("video/x-raw")
+            .field("format", self.gst_format)
+            .field("width", self.width as i32)
+            .field("height", self.height as i32)
+            .field("framerate", gst::Fraction::new(60, 1))
+            .build()
     }
 }
 
@@ -399,6 +436,46 @@ fn create_shm_fd(byte_len: usize) -> Result<OwnedFd> {
     Ok(fd)
 }
 
+enum CaptureBuffers {
+    Dmabuf(dmabuf::Pool),
+    Shm(ShmFrameBuffer),
+}
+
+impl CaptureBuffers {
+    fn is_dmabuf(&self) -> bool {
+        matches!(self, Self::Dmabuf(_))
+    }
+
+    fn caps(&self) -> gst::Caps {
+        match self {
+            Self::Dmabuf(pool) => pool.caps(),
+            Self::Shm(buffer) => buffer.caps(),
+        }
+    }
+
+    fn available(&self) -> Option<(usize, &WlBuffer)> {
+        match self {
+            Self::Dmabuf(pool) => pool.available().map(|slot| (slot, pool.wl_buffer(slot))),
+            Self::Shm(buffer) => Some((0, &buffer.wl_buffer)),
+        }
+    }
+
+    fn complete(&mut self, slot: usize) -> Result<()> {
+        match self {
+            Self::Dmabuf(pool) => pool.complete(slot),
+            Self::Shm(buffer) => buffer.complete()?,
+        }
+        Ok(())
+    }
+
+    fn latest(&self) -> Result<Option<gst::Buffer>> {
+        match self {
+            Self::Dmabuf(pool) => pool.latest(),
+            Self::Shm(buffer) => Ok(buffer.latest.clone()),
+        }
+    }
+}
+
 struct EncoderPipeline {
     pipeline: gst::Pipeline,
     appsrc: AppSrc,
@@ -407,7 +484,6 @@ struct EncoderPipeline {
     applied_bitrate: u32,
     width: u32,
     height: u32,
-    gst_format: &'static str,
     started: Instant,
     seq: u64,
 }
@@ -416,13 +492,15 @@ impl EncoderPipeline {
     fn new(
         width: u32,
         height: u32,
-        gst_format: &'static str,
+        buffers: &CaptureBuffers,
         settings: DesktopSettings,
     ) -> Result<Self> {
         let bitrate = capture::scaled_bitrate(settings, width, height);
-        let (_codec, tail) = capture::encoder_tail(settings.hevc, bitrate)?;
+        // Wayland capture is already paced. Feed static frames straight to
+        // the encoder so a single frame can be sent on resume or keyframe request.
+        let (_codec, tail) = capture::encoder_tail(settings.hevc, bitrate, buffers.is_dmabuf())?;
         let pipeline_desc = format!(
-            "appsrc name=source is-live=true format=time do-timestamp=true block=false max-buffers=2 leaky-type=downstream ! videorate name=capture_rate drop-only=true ! video/x-raw,framerate=60/1 ! {tail} ! appsink name=encoded sync=false max-buffers=2 drop=false"
+            "appsrc name=source is-live=true format=time do-timestamp=true block=false max-buffers=2 max-bytes=0 leaky-type=downstream ! {tail} ! appsink name=encoded sync=false max-buffers=2 drop=false"
         );
         let pipeline = gst::parse::launch(&pipeline_desc)?
             .downcast::<gst::Pipeline>()
@@ -435,13 +513,7 @@ impl EncoderPipeline {
             .context("Missing appsrc")?
             .downcast::<AppSrc>()
             .map_err(|_| anyhow::anyhow!("Invalid appsrc element"))?;
-        let src_caps = gst::Caps::builder("video/x-raw")
-            .field("format", gst_format)
-            .field("width", width as i32)
-            .field("height", height as i32)
-            .field("framerate", gst::Fraction::new(0, 1))
-            .build();
-        appsrc.set_caps(Some(&src_caps));
+        appsrc.set_caps(Some(&buffers.caps()));
         let appsink = pipeline
             .by_name("encoded")
             .context("Missing appsink")?
@@ -457,29 +529,26 @@ impl EncoderPipeline {
             applied_bitrate: bitrate,
             width,
             height,
-            gst_format,
             started: Instant::now(),
             seq: 0,
         })
     }
 
-    fn push_bytes(&mut self, output_name: &str, bytes: &[u8]) -> Result<()> {
-        let mut buffer = gst::Buffer::with_size(bytes.len())?;
-        {
-            let buf_ref = buffer.get_mut().context("Buffer not mutable")?;
-            let now = gst::ClockTime::from_nseconds(self.started.elapsed().as_nanos() as u64);
-            buf_ref.set_pts(now);
-            buf_ref.set_dts(now);
-            buf_ref.set_offset(self.seq);
-            self.seq = self.seq.wrapping_add(1);
-            let mut map = buf_ref.map_writable()?;
-            map.as_mut_slice().copy_from_slice(bytes);
-        }
-        metrics::emit(output_name, "captured", self.seq, bytes.len() as u64);
+    fn push_latest(&mut self, output_name: &str, buffers: &CaptureBuffers) -> Result<bool> {
+        let Some(mut buffer) = buffers.latest()? else {
+            return Ok(false);
+        };
+        let now = gst::ClockTime::from_nseconds(self.started.elapsed().as_nanos() as u64);
+        let buf_ref = buffer.make_mut();
+        buf_ref.set_pts(now);
+        buf_ref.set_dts(now);
+        self.seq = self.seq.wrapping_add(1);
+        buf_ref.set_offset(self.seq);
+        metrics::emit(output_name, "captured", self.seq, buffer.size() as u64);
         self.appsrc
             .push_buffer(buffer)
-            .map(|_| ())
-            .map_err(|err| anyhow::anyhow!("appsrc push_buffer failed: {err:?}"))
+            .map_err(|err| anyhow::anyhow!("appsrc push_buffer failed: {err:?}"))?;
+        Ok(true)
     }
 
     fn update_bitrate(&mut self, id: u32, settings: DesktopSettings) -> Result<()> {
@@ -555,6 +624,7 @@ pub fn stream_virtual_output(
     let qh = queue.handle();
 
     let wl_shm: WlShm = globals.bind(&qh, 1..=1, ()).context("Bind wl_shm")?;
+    let dmabuf = globals.bind::<ZwpLinuxDmabufV1, _, _>(&qh, 4..=5, ()).ok();
     let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
         .bind(&qh, 1..=1, ())
         .context("Bind ext_output_image_capture_source_manager_v1")?;
@@ -565,9 +635,10 @@ pub fn stream_virtual_output(
     let mut state = CaptureState::new(output_name.to_owned());
     for g in globals.contents().clone_list() {
         if g.interface == WlOutput::interface().name {
-            let wl_output: WlOutput = globals
-                .registry()
-                .bind(g.name, g.version.min(4), &qh, g.name);
+            let wl_output: WlOutput =
+                globals
+                    .registry()
+                    .bind(g.name, g.version.min(4), &qh, g.name);
             state.outputs.push(OutputEntry {
                 registry_name: g.name,
                 proxy: wl_output,
@@ -588,12 +659,12 @@ pub fn stream_virtual_output(
         poll_wayland(&conn, &mut queue, &mut state, 25)?;
     }
 
-    let mut encoder: Option<EncoderPipeline> = None;
-    let mut announced: Option<(u32, u32)> = None;
+    let mut try_dmabuf = dmabuf.is_some();
     let mut playing = lock(&shared.visibility).get(&id).copied().unwrap_or(true);
-    let mut last_frame: Option<Vec<u8>> = None;
 
-    'session_loop: while !cancel.load(Ordering::Acquire) && !output.stopped() && !state.output_removed
+    'session_loop: while !cancel.load(Ordering::Acquire)
+        && !output.stopped()
+        && !state.output_removed
     {
         let Some(wl_output) = state.target_output().cloned() else {
             break;
@@ -604,10 +675,13 @@ pub fn stream_virtual_output(
         let _ = conn.flush();
 
         let mut active_gen = state.constraints_gen;
-        let mut shm: Option<ShmFrameBuffer> = None;
-        let mut in_flight_frame: Option<ExtImageCopyCaptureFrameV1> = None;
-        let mut last_capture_at = Instant::now() - Duration::from_secs(1);
-        let mut last_push_at = Instant::now() - Duration::from_secs(1);
+        let mut buffers: Option<CaptureBuffers> = None;
+        let mut encoder: Option<EncoderPipeline> = None;
+        let mut announced: Option<(u32, u32)> = None;
+        let mut in_flight_frame = None::<(ExtImageCopyCaptureFrameV1, usize)>;
+        let mut next_capture_at = Instant::now();
+        let mut last_push_at = next_capture_at - Duration::from_secs(1);
+        let mut first_push_at = None;
         let frame_interval = Duration::from_nanos(1_000_000_000 / 60);
 
         while !cancel.load(Ordering::Acquire)
@@ -615,145 +689,184 @@ pub fn stream_virtual_output(
             && !state.output_removed
             && !state.session_stopped
         {
-            poll_wayland(&conn, &mut queue, &mut state, 12)?;
+            let poll_timeout = if !playing {
+                50
+            } else if in_flight_frame.is_some() {
+                5
+            } else {
+                let until_capture = next_capture_at.saturating_duration_since(Instant::now());
+                (until_capture.as_micros().div_ceil(1000) as i32).clamp(1, 5)
+            };
+            poll_wayland(&conn, &mut queue, &mut state, poll_timeout)?;
             if state.session_stopped || state.output_removed {
                 break;
             }
 
+            let (width, height) = state.active_size;
+            if width == 0 || height == 0 {
+                continue;
+            }
             let settings = shared.settings();
-            if state.constraints_gen != active_gen || shm.is_none() {
-                if state.active_size.0 > 0
-                    && state.active_size.1 > 0
-                    && !state.active_formats.is_empty()
+
+            if state.constraints_gen != active_gen || buffers.is_none() {
+                if let Some((frame, _)) = in_flight_frame.take()
+                    && state.frame_status == FrameStatus::Pending
                 {
-                    let (w, h) = state.active_size;
-                    let needs_rebuf = shm.as_ref().is_none_or(|b| {
-                        b.width != w
-                            || b.height != h
-                            || !state.active_formats.contains(&b.format)
-                    });
-                    if needs_rebuf {
-                        shm = Some(ShmFrameBuffer::allocate(
-                            &wl_shm,
-                            &qh,
-                            w,
-                            h,
-                            &state.active_formats,
-                        )?);
-                    }
-                    active_gen = state.constraints_gen;
+                    frame.destroy();
                 }
+                state.frame_status = FrameStatus::Idle;
+                drop(encoder.take());
+                active_gen = state.constraints_gen;
+                let mut new_buffers = None;
+                if try_dmabuf && let Some(dmabuf) = &dmabuf {
+                    match dmabuf::Pool::new(dmabuf, &conn, &mut queue, &mut state) {
+                        Ok(pool) => {
+                            new_buffers = Some(CaptureBuffers::Dmabuf(pool));
+                        }
+                        Err(_) if state.session_stopped || state.output_removed => break,
+                        Err(_) if state.constraints_gen != active_gen => continue,
+                        Err(err) => {
+                            eprintln!("Virtual surface {id} ({output_name}): using SHM: {err:#}");
+                            try_dmabuf = false;
+                        }
+                    }
+                }
+                buffers = Some(match new_buffers {
+                    Some(buffers) => buffers,
+                    None => CaptureBuffers::Shm(ShmFrameBuffer::allocate(
+                        &wl_shm,
+                        &qh,
+                        width,
+                        height,
+                        &state.active_formats,
+                    )?),
+                });
             }
 
-            let Some(buf) = shm.as_ref() else {
-                continue;
-            };
-
-            let rebuild_encoder = encoder.as_ref().is_none_or(|enc| {
-                enc.width != buf.width
-                    || enc.height != buf.height
-                    || enc.gst_format != buf.gst_format
-                    || enc.hevc != settings.hevc
-            });
+            let buffers = buffers.as_mut().expect("allocated capture buffers");
+            let rebuild_encoder = encoder.as_ref().is_none_or(|enc| enc.hevc != settings.hevc);
             if rebuild_encoder {
                 drop(encoder.take());
-                encoder = Some(EncoderPipeline::new(
-                    buf.width,
-                    buf.height,
-                    buf.gst_format,
-                    settings,
-                )?);
+                match EncoderPipeline::new(width, height, buffers, settings) {
+                    Ok(new_encoder) => encoder = Some(new_encoder),
+                    Err(err) if buffers.is_dmabuf() => {
+                        eprintln!("Virtual surface {id} ({output_name}): using SHM: {err:#}");
+                        try_dmabuf = false;
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
                 announced = None;
-                last_frame = None;
+                first_push_at = None;
+                if buffers.is_dmabuf() {
+                    eprintln!("Virtual surface {id} ({output_name}): capturing via DMA-BUF");
+                }
             }
-            let enc = encoder.as_mut().unwrap();
+            let enc = encoder.as_mut().expect("started capture encoder");
             enc.update_bitrate(id, settings)?;
 
             let visible = lock(&shared.visibility).get(&id).copied().unwrap_or(true);
+            let resumed = visible && !playing;
             if visible != playing {
                 playing = visible;
                 if playing {
+                    next_capture_at = Instant::now();
                     while enc.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
-                    capture::force_keyframe(&enc.pipeline);
-                    if let Some(frame_bytes) = last_frame.as_deref() {
-                        let _ = enc.push_bytes(output_name, frame_bytes);
-                        last_push_at = Instant::now();
-                    }
                     metrics::event(output_name, "encoding");
                     eprintln!("Virtual surface {id} ({output_name}): streaming");
                 } else {
+                    first_push_at = None;
                     metrics::event(output_name, "encoding stopped");
                     eprintln!("Virtual surface {id} ({output_name}): hidden; encoding stopped");
                 }
             }
 
+            let mut fresh_frame = false;
             match state.frame_status {
                 FrameStatus::Ready => {
-                    in_flight_frame = None;
+                    let (_, slot) = in_flight_frame
+                        .take()
+                        .context("Missing finished capture slot")?;
                     state.frame_status = FrameStatus::Idle;
-                    let bytes = buf.as_slice();
-                    let store = last_frame.get_or_insert_with(|| vec![0u8; bytes.len()]);
-                    if store.len() != bytes.len() {
-                        store.resize(bytes.len(), 0);
-                    }
-                    store.copy_from_slice(bytes);
-                    if playing {
-                        enc.push_bytes(output_name, store)?;
-                        last_push_at = Instant::now();
-                    }
+                    buffers.complete(slot)?;
+                    fresh_frame = true;
                 }
                 FrameStatus::Failed(reason) => {
                     in_flight_frame = None;
                     state.frame_status = FrameStatus::Idle;
-                    match reason {
-                        Some(FailureReason::BufferConstraints) => {
-                            shm = None;
-                            continue;
-                        }
-                        Some(FailureReason::Stopped) => break,
-                        _ => {}
+                    if reason == Some(FailureReason::Stopped) {
+                        break;
+                    }
+                    if buffers.is_dmabuf() {
+                        eprintln!(
+                            "Virtual surface {id} ({output_name}): using SHM after DMA-BUF capture failure: {reason:?}"
+                        );
+                        try_dmabuf = false;
+                        break;
+                    }
+                    if reason == Some(FailureReason::BufferConstraints) {
+                        break;
                     }
                 }
                 FrameStatus::Pending | FrameStatus::Idle => {}
             }
 
-            if playing && lock(&shared.keyframes).remove(&id) {
+            let keyframe_requested = playing && lock(&shared.keyframes).remove(&id);
+            if playing && (resumed || keyframe_requested) {
                 metrics::event(output_name, "keyframe requested");
                 capture::force_keyframe(&enc.pipeline);
-                if let Some(frame_bytes) = last_frame.as_deref() {
-                    let _ = enc.push_bytes(output_name, frame_bytes);
-                    last_push_at = Instant::now();
+            }
+            // Resend the latest frame on resume or if the encoder is waiting for
+            // input on a static desktop. A fresh frame also serves either request.
+            if playing
+                && (fresh_frame
+                    || resumed
+                    || keyframe_requested
+                    || rebuild_encoder
+                    || (announced.is_none()
+                        && last_push_at.elapsed() >= Duration::from_millis(100)))
+            {
+                match enc.push_latest(output_name, buffers) {
+                    Ok(true) => {
+                        last_push_at = Instant::now();
+                        first_push_at.get_or_insert(last_push_at);
+                    }
+                    Ok(false) => {}
+                    Err(err) if buffers.is_dmabuf() => {
+                        eprintln!("Virtual surface {id} ({output_name}): using SHM: {err:#}");
+                        try_dmabuf = false;
+                        break;
+                    }
+                    Err(err) => return Err(err),
                 }
             }
 
-            // Static virtual monitors produce an initial frame then wait for damage on subsequent captures;
-            // re-push the last frame every 100 ms until the encoder outputs its first frame.
-            if playing
-                && announced.is_none()
-                && let Some(frame_bytes) = last_frame.as_deref()
-                && last_push_at.elapsed() >= Duration::from_millis(100)
-            {
-                let _ = enc.push_bytes(output_name, frame_bytes);
-                last_push_at = Instant::now();
-            }
-
-            if playing
-                && in_flight_frame.is_none()
-                && state.frame_status == FrameStatus::Idle
-                && last_capture_at.elapsed() >= frame_interval
-            {
-                let frame = session.create_frame(&qh, ());
-                frame.attach_buffer(&buf.wl_buffer);
-                frame.damage_buffer(0, 0, buf.width as i32, buf.height as i32);
-                frame.capture();
-                let _ = conn.flush();
-                in_flight_frame = Some(frame);
-                state.frame_status = FrameStatus::Pending;
-                last_capture_at = Instant::now();
+            if playing && in_flight_frame.is_none() && Instant::now() >= next_capture_at {
+                if let Some((slot, wl_buffer)) = buffers.available() {
+                    let frame = session.create_frame(&qh, ());
+                    frame.attach_buffer(wl_buffer);
+                    frame.damage_buffer(0, 0, width as i32, height as i32);
+                    frame.capture();
+                    let _ = conn.flush();
+                    in_flight_frame = Some((frame, slot));
+                    state.frame_status = FrameStatus::Pending;
+                    next_capture_at = (next_capture_at + frame_interval).max(Instant::now());
+                } else if next_capture_at.elapsed() >= Duration::from_secs(2) {
+                    eprintln!(
+                        "Virtual surface {id} ({output_name}): using SHM after DMA-BUF slots stopped recycling"
+                    );
+                    try_dmabuf = false;
+                    break;
+                }
             }
 
             while let Some(sample) = enc.appsink.try_pull_sample(gst::ClockTime::ZERO) {
-                let caps = sample.caps().context("Encoded virtual frame without caps")?;
+                if !playing {
+                    continue;
+                }
+                let caps = sample
+                    .caps()
+                    .context("Encoded virtual frame without caps")?;
                 let structure = caps.structure(0).context("Empty virtual caps")?;
                 let size = (
                     u32::try_from(structure.get::<i32>("width")?)?,
@@ -789,19 +902,35 @@ pub fn stream_virtual_output(
                 ])
             {
                 if msg.type_() != gst::MessageType::Warning {
+                    if buffers.is_dmabuf() {
+                        eprintln!("Virtual surface {id} ({output_name}): using SHM: {msg:?}");
+                        try_dmabuf = false;
+                        break;
+                    }
                     bail!("Virtual capture GStreamer error: {msg:?}");
                 }
                 metrics::event(output_name, &format!("{msg:?}"));
             }
 
-            if !playing {
-                std::thread::sleep(Duration::from_millis(50));
+            if buffers.is_dmabuf()
+                && announced.is_none()
+                && first_push_at.is_some_and(|first| first.elapsed() >= Duration::from_secs(2))
+            {
+                eprintln!(
+                    "Virtual surface {id} ({output_name}): using SHM after DMA-BUF encoder timeout"
+                );
+                try_dmabuf = false;
+                break;
             }
         }
 
-        if let Some(frame) = in_flight_frame.take() {
+        drop(encoder);
+        if let Some((frame, _)) = in_flight_frame
+            && state.frame_status == FrameStatus::Pending
+        {
             frame.destroy();
         }
+        drop(buffers);
         session.destroy();
         source.destroy();
         let _ = conn.flush();
@@ -816,7 +945,6 @@ pub fn stream_virtual_output(
         }
     }
 
-    drop(encoder);
     Ok(())
 }
 
@@ -831,11 +959,11 @@ mod tests {
     #[ignore = "requires a running Hyprland desktop session and GStreamer hardware encoder"]
     #[test]
     fn live_hyprland_ext_image_copy_capture() {
-        struct HeadlessGuard(&'static str);
+        struct HeadlessGuard(String);
         impl Drop for HeadlessGuard {
             fn drop(&mut self) {
                 let _ = Command::new("hyprctl")
-                    .args(["output", "remove", self.0])
+                    .args(["output", "remove", &self.0])
                     .output();
             }
         }
@@ -873,47 +1001,43 @@ mod tests {
         extern "C" fn on_removed(_user: *mut c_void, _id: u32) {}
         extern "C" fn on_region(_user: *mut c_void, _id: u32, _region: *const f32) {}
 
-        let _ = Command::new("hyprctl")
-            .args(["output", "remove", "FRAME-V1"])
-            .output();
-        let _guard = HeadlessGuard("FRAME-V1");
-
-        assert!(
-            supports_ext_image_copy_capture(),
-            "Compositor lacks ext-image-copy-capture-v1"
-        );
+        assert!(supports_ext_image_copy_capture());
         gstreamer::init().expect("gstreamer init");
 
-        let backend = crate::compositor::hyprland::HyprlandBackend::from_env()
-            .expect("connect to Hyprland IPC");
-        let initial_monitors =
-            crate::compositor::CompositorBackend::list_monitors(&backend).expect("list monitors");
-        let pin_updates: Vec<OutputConfigUpdate> = initial_monitors
-            .iter()
-            .filter(|m| !capture::is_virtual_output_name(&m.name))
-            .map(|m| OutputConfigUpdate {
-                name: m.name.clone(),
-                mode: None,
-                pos: Some(m.logical_pos),
-                scale: Some(m.scale),
-            })
-            .collect();
-
-        let create = Command::new("hyprctl")
-            .args(["output", "create", "headless", "FRAME-V1"])
-            .output()
-            .expect("create FRAME-V1");
-        assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "ok");
-
-        std::thread::sleep(Duration::from_millis(100));
-        let mut updates = pin_updates.clone();
-        updates.push(OutputConfigUpdate {
-            name: "FRAME-V1".into(),
-            mode: Some((1920, 1080, 60)),
-            pos: Some((0, -1080)),
-            scale: Some(1.0),
+        // A preconfigured output can be used with an isolated Wayland server
+        // or with an animation window already running on it.
+        let mut reposition = None;
+        let mut guard = None;
+        let output_name = std::env::var("FRAME_TEST_CAPTURE_OUTPUT").unwrap_or_else(|_| {
+            let name = format!("FRAME-CAPTURE-TEST-{}", std::process::id());
+            let backend = crate::compositor::hyprland::HyprlandBackend::from_env()
+                .expect("connect to Hyprland IPC");
+            let monitors = crate::compositor::CompositorBackend::list_monitors(&backend)
+                .expect("list monitors");
+            let top = monitors.iter().map(|m| m.logical_pos.1).min().unwrap_or(0);
+            let mut updates: Vec<_> = monitors
+                .iter()
+                .map(|m| OutputConfigUpdate {
+                    name: m.name.clone(),
+                    mode: None,
+                    pos: Some(m.logical_pos),
+                    scale: Some(m.scale),
+                })
+                .collect();
+            crate::compositor::CompositorBackend::create_headless_output(&backend, &name)
+                .expect("create test output");
+            guard = Some(HeadlessGuard(name.clone()));
+            updates.push(OutputConfigUpdate {
+                name: name.clone(),
+                mode: Some((1920, 1080, 60)),
+                pos: Some((0, top - 1080)),
+                scale: Some(1.0),
+            });
+            apply_output_layout(&updates).expect("configure test output");
+            updates.last_mut().unwrap().pos = Some((1920, top - 1080));
+            reposition = Some(updates);
+            name
         });
-        apply_output_layout(&updates).expect("configure FRAME-V1 1920x1080@60 above");
 
         let events: Box<Mutex<CaptureEvents>> = Box::default();
         let user_ptr = Box::into_raw(events);
@@ -932,10 +1056,11 @@ mod tests {
         let output_thread = output.clone();
         let shared_thread = shared.clone();
         let cancel_thread = cancel.clone();
+        let capture_name = output_name.clone();
         let handle = std::thread::spawn(move || {
             stream_virtual_output(
                 wayvr_ipc::frame::VIRTUAL_SURFACE_BASE,
-                "FRAME-V1",
+                &capture_name,
                 &cancel_thread,
                 &output_thread,
                 &shared_thread,
@@ -958,25 +1083,41 @@ mod tests {
             drop(guard);
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(got_frame, "expected encoded frame from ext-image-copy-capture");
 
-        // Reposition FRAME-V1 live while capture session runs
-        let mut reposition_updates = pin_updates;
-        reposition_updates.push(OutputConfigUpdate {
-            name: "FRAME-V1".into(),
-            mode: Some((1920, 1080, 60)),
-            pos: Some((2560, 0)),
-            scale: Some(1.0),
-        });
-        apply_output_layout(&reposition_updates).expect("reposition FRAME-V1 while capturing");
+        if let Some(updates) = reposition {
+            apply_output_layout(&updates).expect("reposition test output while capturing");
+        }
+        let surface = wayvr_ipc::frame::VIRTUAL_SURFACE_BASE;
+        let frames_before = events_ref.lock().unwrap().video_frames;
+        std::thread::sleep(Duration::from_secs(1));
+        let frames_after = events_ref.lock().unwrap().video_frames;
+        println!("Visible frames over 1s: {}", frames_after - frames_before);
+
+        lock(&shared.visibility).insert(surface, false);
         std::thread::sleep(Duration::from_millis(200));
+        let hidden_frames = events_ref.lock().unwrap().video_frames;
+        std::thread::sleep(Duration::from_millis(250));
+        let stayed_paused = hidden_frames == events_ref.lock().unwrap().video_frames;
+        lock(&shared.visibility).insert(surface, true);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while events_ref.lock().unwrap().video_frames == hidden_frames && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let resumed = events_ref.lock().unwrap().video_frames > hidden_frames;
 
         cancel.store(true, Ordering::Release);
         let res = handle.join().expect("join capture thread");
         assert!(res.is_ok(), "capture returned error: {res:?}");
+        assert!(
+            got_frame,
+            "expected encoded frame from ext-image-copy-capture"
+        );
         drop(output);
         unsafe {
             drop(Box::from_raw(user_ptr));
         }
+        assert!(stayed_paused, "hidden output continued streaming");
+        assert!(resumed, "no frame sent on resume");
     }
 }

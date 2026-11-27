@@ -536,7 +536,11 @@ fn monitor_bitrate(settings: DesktopSettings, monitor: &Monitor) -> u32 {
         .clamp(2000, 150000)
 }
 
-pub(crate) fn encoder_tail(hevc: bool, bitrate: u32) -> Result<(&'static str, String)> {
+pub(crate) fn encoder_tail(
+    hevc: bool,
+    bitrate: u32,
+    va_memory: bool,
+) -> Result<(&'static str, String)> {
     let (codec, parse, caps) = if hevc {
         ("h265", "h265parse", "video/x-h265")
     } else {
@@ -545,9 +549,16 @@ pub(crate) fn encoder_tail(hevc: bool, bitrate: u32) -> Result<(&'static str, St
     // Keyframes come on request when the headset loses a frame; periodic ones would only be large bursts (VA caps at 1024).
     // VBR with the target at the configured rate: CBR pads a static desktop to the full rate over Wi-Fi
     let encoder = if gst::ElementFactory::find(&format!("va{codec}enc")).is_some() {
+        let raw_caps = if va_memory {
+            "video/x-raw(memory:VAMemory)"
+        } else {
+            "video/x-raw"
+        };
         format!(
-            "vapostproc ! video/x-raw,format=NV12 ! va{codec}enc name=encoder rate-control=vbr target-percentage=100 bitrate={bitrate} key-int-max=1024 b-frames=0"
+            "vapostproc ! {raw_caps},format=NV12 ! va{codec}enc name=encoder rate-control=vbr target-percentage=100 bitrate={bitrate} key-int-max=1024 b-frames=0"
         )
+    } else if va_memory {
+        bail!("No VA {codec} encoder available for DMA-BUF capture");
     } else if gst::ElementFactory::find(&format!("nv{codec}enc")).is_some() {
         format!(
             "videoconvert ! video/x-raw,format=NV12 ! nv{codec}enc name=encoder bitrate={bitrate} gop-size=1200 bframes=0 zerolatency=true"
@@ -616,7 +627,7 @@ fn stream_codec(
     settings: DesktopSettings,
 ) -> Result<()> {
     let bitrate = monitor_bitrate(settings, monitor);
-    let (codec, tail) = encoder_tail(settings.hevc, bitrate)?;
+    let (codec, tail) = encoder_tail(settings.hevc, bitrate, false)?;
     // DMA-bufs when the encoder path takes them: a shared-memory cast has the compositor read every frame back
     // (tens of ms on Intel iGPUs). Load is shed by the leaky raw queue: a dropped encoded frame would corrupt the
     // stream until the next keyframe without the headset seeing a loss.

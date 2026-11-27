@@ -23,7 +23,6 @@ pub struct TopRowHost {
     pub cookie: String,
     pub source: Option<u32>,
     pub presenting: bool,
-    pub virtual_supported: bool,
     pub clients: Vec<RunningClient>,
     pub status: String,
 }
@@ -40,10 +39,6 @@ pub fn top_row_hosts() -> Vec<TopRowHost> {
         .filter(|pc| pc.paired || pc.source.is_some())
         .map(|pc| {
             let presenting = pc.source.is_some() && pc.source == background;
-            let virtual_supported = pc
-                .source
-                .and_then(crate::frame_host::virtual_state)
-                .is_some_and(|state| state.capabilities.supported);
             let mut status = pc.status(presenting);
             if pc
                 .source
@@ -56,7 +51,6 @@ pub fn top_row_hosts() -> Vec<TopRowHost> {
                 cookie: pc.id,
                 source: pc.source,
                 presenting,
-                virtual_supported,
                 clients: pc.source.map_or_else(Vec::new, pc_clients),
                 status,
             }
@@ -229,7 +223,6 @@ pub fn top_row_signature(app: &AppState) -> u64 {
             &host.cookie,
             host.source,
             host.presenting,
-            host.virtual_supported,
             &host.status,
         )
             .hash(&mut hasher);

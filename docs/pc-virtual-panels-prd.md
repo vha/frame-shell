@@ -212,7 +212,7 @@ pub trait CompositorBackend: Send + Sync {
 | **`Window`** | Record the window's original workspace/monitor; create `FRAME-V{k}` + `name:frame-v{k}`; migrate the window via `movetoworkspacesilent`. | If that window is already owned by an active virtual panel, unhide/focus that panel instead of creating a second one. | Auto-closes if the tracked window exits (or is manually moved off `FRAME-V{k}`), evacuating any extra windows moved onto `name:frame-v{k}` first. On close/disconnect, return the window to its recorded workspace (or recorded monitor if the workspace vanished, fallback: primary physical monitor) before `output remove`. |
 | **`Workspace`** | Record the workspace's original physical monitor; create `FRAME-V{k}` and move existing workspace `<id>` onto it via `moveworkspacetomonitor` (no `name:frame-v{k}` created). | If that workspace is already on an active virtual panel, unhide/focus that panel instead of creating a second one. | Stays open if empty. On close/disconnect, `moveworkspacetomonitor <id> <return_monitor>` (fallback: primary physical monitor if the original monitor was unplugged) before `output remove`. |
 
-- **Output positioning:** Use `keyword monitor "<name>,<w>x<h>@<hz>,<x>x<y>,<scale>"` (and optionally `zwlr_output_manager_v1` from `wayland-protocols-wlr` 0.3.12, already present in [`desktop/Cargo.lock`](../desktop/Cargo.lock), as a compositor-neutral positioning/mode mechanism shared with Sway/niri).
+- **Output positioning:** The host uses `zwlr_output_manager_v1` to configure headless output modes and positions while preserving the positions and scales of physical outputs. It uses Lua dispatchers for current Hyprland releases and classic dispatchers for legacy configurations.
 
 #### Requirements to Support Additional Compositors
 Any new compositor backend (Sway, niri, KWin, etc.) must satisfy five requirements before enabling `VirtualCapabilities.supported = true`:
@@ -238,10 +238,10 @@ Today, [`desktop/src/capture.rs`](../desktop/src/capture.rs) (lines 94–112) cr
 - Why not `zwlr_export_dmabuf_manager_v1`? Hyprland dropped `zwlr_export_dmabuf_manager_v1` when moving off `wlroots`.
 - Why not `xdg-desktop-portal-hyprland`? XDPH blocks all streams whenever its picker runs and doesn't expose programmatic headless-output selection without a restore-token prompt.
 - **Solution:** Capture each `FRAME-V*` `WlOutput` directly using **`ext-image-copy-capture-v1`** (paired with `ext-output-image-capture-source-manager-v1`, both available in `wayland-protocols` 0.32.13, already in [`desktop/Cargo.lock`](../desktop/Cargo.lock)).
-- Feed captured frames into a GStreamer `appsrc` driving the **exact same encoder tail** currently in `stream_codec` ([`desktop/src/capture.rs`](../desktop/src/capture.rs) line 308): `videorate drop-only=true` → `va{codec}enc`/`nv{codec}enc` → `h264parse`/`h265parse` → `appsink`.
+- The capture loop paces frames and feeds them to GStreamer through `appsrc`. The host shares its hardware encoder and parser setup with physical monitor capture ([`desktop/src/capture.rs`](../desktop/src/capture.rs)).
 - **Two-stage rollout for capture buffers:**
   1. **Stage A (Phase 2 dev milestone):** Capture into `wl_shm` buffers (`BGRA`/`BGRx`) → push to `appsrc` (`video/x-raw,format=BGRx`) → `vapostproc`/`videoconvert` → `NV12`. Fast to validate end-to-end.
-  2. **Stage B (Ship target):** Allocate GBM / `linux-dmabuf` buffers (`zwp_linux_dmabuf_v1`), attach them to `ext_image_copy_capture_frame_v1`, and push `GstMemory` DMA-buf buffers (`video/x-raw(memory:DMABuf)`) straight into `vapostproc` for zero CPU readback under multi-panel + VR workloads.
+  2. **Stage B:** Allocate GBM buffers with a format and modifier supported by both Wayland and the VA postprocessor. Pass them to Wayland through `zwp_linux_dmabuf_v1` and to `vapostproc` as `video/x-raw(memory:DMABuf)`. The postprocessor passes NV12 VA surfaces to the encoder. If allocation, import, or encoding fails, fall back to SHM. Hosts with only NVENC use SHM.
 - **Cursor handling:** Request `paint_cursors = 1` when creating the `ext_image_copy_capture_session_v1` (just as `embed_mouse: true` is used for physical monitors) so the cursor renders inside the panel when hovering it, and does not freeze on screen when the cursor leaves.
 
 ### 4.5 Headset — UI Entry Points, Interactive Overlays & 3D-to-2D Layout Solver
@@ -291,6 +291,7 @@ Today, [`desktop/src/capture.rs`](../desktop/src/capture.rs) (lines 94–112) cr
      - Score surviving candidates by Euclidean distance between candidate center `(cx, cy)` and `(tx, ty)`, applying **hysteresis** (subtract a sticky bonus, e.g., 64 logical px, when the candidate touches the same `(parent_id, edge_side)` as the panel's previously committed placement so near-diagonal placements don't flip-flop on minor adjustments). Tie-break deterministically by `(parent_id, edge_side, x, y)`.
      - **Guaranteed fallback:** If every candidate collides (e.g., crowded inner pockets), place `V` flush against the rightmost `max_x` edge of `placed`'s bounding box aligned vertically with an existing monitor row, which is mathematically guaranteed never to overlap.
      - Commit the winning `(x, y)` to `placed`.
+   - Make horizontal and vertical passes to close short gaps between facing edges. Move virtual groups together where possible and preserve physical positions, connectivity, and the no-overlap rule.
 3. **Debounce & Auto-Sync Toggle Behavior:**
    - Trigger the solver ~300–500 ms after grab release (alongside `layout_changed()` in [`wayvr/wayvr/src/frame_shell/desktops.rs`](../wayvr/wayvr/src/frame_shell/desktops.rs)) and on virtual panel add/close.
    - Skip sending `SyncPanelLayout` if the resulting `(x, y)` coordinates for all virtual panels match the last committed layout.
@@ -388,7 +389,7 @@ Follow these phases sequentially. Every phase ends with concrete verification st
 **Tasks:**
 1. Bind `ext_output_image_capture_source_manager_v1` and `ext_image_copy_capture_manager_v1` from the Wayland registry.
 2. Create an `ext_image_copy_capture_session_v1` for the target `WlOutput` with cursor painting enabled (`Options::PaintCursors`).
-3. **Stage A (Dev milestone — SHM):** Read buffer constraints (`shm_format`, `buffer_size`), allocate a double-buffered `memfd` `wl_shm_pool`, attach damage, capture frames at up to 60 Hz (respecting `capture_enabled` visibility flag so hidden panels pause capture/encoding!), and push `gstreamer::Buffer`s into a GStreamer `appsrc` (`is-live=true`, `format=Time`, `do-timestamp=true`) feeding `videorate ! videoconvert ! video/x-raw,format=NV12 ! {encoder}`.
+3. **Stage A (Dev milestone — SHM):** Read buffer constraints (`shm_format`, `buffer_size`), allocate a `memfd` `wl_shm_pool`, and capture at up to 60 Hz while the panel is visible. Copy each completed frame into an owned GStreamer buffer before reusing the Wayland buffer. Feed the result through `appsrc` to hardware encoding.
 4. **Stage B (Ship target — zero-copy DMA-buf):** Read `dmabuf_device` / `dmabuf_format` constraints, allocate GBM/DRM-backed DMA-bufs, and push `gstreamer_allocators::DmaBufAllocator` buffers directly to `vapostproc` to eliminate CPU copies.
 5. Handle `Stopped` / `SizeChanged` session events cleanly (recreate session on `Stopped` if output still exists; resize swaps `appsrc` caps or rebuilds pipeline; output removal exits worker thread).
 

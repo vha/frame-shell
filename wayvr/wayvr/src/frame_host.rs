@@ -46,6 +46,7 @@ struct State {
     frames: VecDeque<SessionFrame>,
     errors: VecDeque<String>,
     notifications: VecDeque<Notification>,
+    virtual_reveals: Vec<(u32, u32)>,
     ipc: VecDeque<IpcEvent>,
 }
 
@@ -55,6 +56,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     frames: VecDeque::new(),
     errors: VecDeque::new(),
     notifications: VecDeque::new(),
+    virtual_reveals: Vec::new(),
     ipc: VecDeque::new(),
 });
 
@@ -210,6 +212,11 @@ pub fn receive(source: u32, data: &[u8]) {
                 crate::frame_shell::bump_lobby_state();
             }
         }
+        HostMessage::RevealVirtualPanel(surface) => {
+            if state.virtual_reveals.len() < 16 {
+                state.virtual_reveals.push((source, surface));
+            }
+        }
         HostMessage::VirtualTargets(targets) => {
             if pc.virtual_targets.as_ref() != Some(&targets) {
                 pc.virtual_targets = Some(targets);
@@ -363,6 +370,10 @@ pub fn take_frames() -> Vec<SessionFrame> {
 
 pub fn take_errors() -> Vec<String> {
     state().errors.drain(..).collect()
+}
+
+pub fn take_virtual_reveals() -> Vec<(u32, u32)> {
+    std::mem::take(&mut state().virtual_reveals)
 }
 
 pub fn take_notifications() -> Vec<Notification> {

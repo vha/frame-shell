@@ -239,6 +239,10 @@ impl CompositorBackend for HyprlandBackend {
         self.request_ok(&format!("output remove {name}"))
     }
 
+    fn focus_output(&self, name: &str) -> Result<()> {
+        self.request_ok(&format_focus_monitor_cmd(self.lua_dispatch, name))
+    }
+
     fn move_window_to_workspace(&self, address: &str, workspace_target: &str) -> Result<()> {
         let addr = normalize_window_address(address);
         self.request_ok(&format_move_window_cmd(

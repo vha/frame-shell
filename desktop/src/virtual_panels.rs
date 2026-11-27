@@ -284,6 +284,7 @@ impl Worker {
         let windows = windows
             .into_iter()
             .map(|w| VirtualWindowTarget {
+                already_shared: self.window_panel(&w.address).is_some(),
                 address: w.address,
                 title: w.title,
                 app_id: w.app_id,
@@ -296,6 +297,7 @@ impl Worker {
             .into_iter()
             .filter(|ws| !owned_workspaces.contains(&ws.id))
             .map(|ws| VirtualWorkspaceTarget {
+                already_shared: self.workspace_panel(ws.id).is_some(),
                 id: ws.id,
                 name: ws.name,
                 monitor: ws.monitor_name,
@@ -307,6 +309,19 @@ impl Worker {
                 windows,
                 workspaces,
             }));
+    }
+
+    fn window_panel(&self, address: &str) -> Option<&ActivePanel> {
+        let address = normalize_window_address(address);
+        self.panels.values().find(|panel| {
+            matches!(&panel.ownership, PanelOwnership::Window { address: owned, .. } if *owned == address)
+        })
+    }
+
+    fn workspace_panel(&self, id: i32) -> Option<&ActivePanel> {
+        self.panels.values().find(|panel| {
+            matches!(panel.ownership, PanelOwnership::Workspace { workspace_id, .. } if workspace_id == id)
+        })
     }
 
     fn handle_create(&mut self, source: VirtualTargetKind, size: [u32; 2]) {
@@ -328,6 +343,19 @@ impl Worker {
             ));
             return;
         }
+        let existing = match &source {
+            VirtualTargetKind::Blank { .. } => None,
+            VirtualTargetKind::Window { address, .. } => self.window_panel(address),
+            VirtualTargetKind::Workspace { id, .. } => self.workspace_panel(*id),
+        };
+        if let Some(panel) = existing {
+            self.output.send(&HostMessage::RevealVirtualPanel(panel.surface));
+            if let Err(err) = backend.focus_output(&panel.output_name) {
+                self.output.send(&HostMessage::Error(format!("Could not focus virtual panel: {err:#}")));
+            }
+            return;
+        }
+
         if self.panels.len() >= self.capabilities.max_panels as usize {
             self.output.send(&HostMessage::Error(format!(
                 "Virtual panel limit reached ({}/{})",
@@ -336,34 +364,6 @@ impl Worker {
             )));
             self.broadcast_state();
             return;
-        }
-
-        // Duplicate target checks
-        match &source {
-            VirtualTargetKind::Blank { .. } => {}
-            VirtualTargetKind::Window { address, .. } => {
-                let norm = normalize_window_address(address);
-                if self.panels.values().any(|p| {
-                    matches!(&p.ownership, PanelOwnership::Window { address: a, .. } if *a == norm)
-                }) {
-                    self.output.send(&HostMessage::Error(
-                        "That window already has an active virtual panel".into(),
-                    ));
-                    self.broadcast_state();
-                    return;
-                }
-            }
-            VirtualTargetKind::Workspace { id, .. } => {
-                if self.panels.values().any(|p| {
-                    matches!(&p.ownership, PanelOwnership::Workspace { workspace_id, .. } if workspace_id == id)
-                }) {
-                    self.output.send(&HostMessage::Error(format!(
-                        "Workspace {id} already has an active virtual panel"
-                    )));
-                    self.broadcast_state();
-                    return;
-                }
-            }
         }
 
         let Some(surface) = virtual_surface_id(self.next_slot) else {
@@ -933,19 +933,19 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::c_void;
+    use std::{collections::BTreeSet, ffi::c_void};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     #[ignore = "requires a running Hyprland desktop session and GStreamer hardware encoder"]
     #[test]
-    fn live_hyprland_blank_panel_lifecycle() {
+    fn live_hyprland_virtual_panel_lifecycle() {
         #[derive(Default)]
         struct Events {
             messages: Vec<HostMessage>,
             surfaces: Vec<u32>,
             removed: Vec<u32>,
-            videos: usize,
+            videos: BTreeSet<u32>,
         }
 
         extern "C" fn on_surface(user: *mut c_void, surface: *const frame_abi::frame_host_surface) {
@@ -958,10 +958,10 @@ mod tests {
             let events = unsafe { &*(user as *const Mutex<Events>) };
             events.lock().unwrap().removed.push(id);
         }
-        extern "C" fn on_video(user: *mut c_void, _id: u32, _data: *const u8, size: usize) {
+        extern "C" fn on_video(user: *mut c_void, id: u32, _data: *const u8, size: usize) {
             if size > 0 {
                 let events = unsafe { &*(user as *const Mutex<Events>) };
-                events.lock().unwrap().videos += 1;
+                events.lock().unwrap().videos.insert(id);
             }
         }
         extern "C" fn on_message(user: *mut c_void, data: *const u8, size: usize) {
@@ -989,20 +989,25 @@ mod tests {
                 if let Some(handle) = self.handle.take() {
                     let _ = handle.join();
                 }
-                for slot in 1..=4 {
-                    let _ = std::process::Command::new("hyprctl")
-                        .args(["output", "remove", &format!("FRAME-V{slot}")])
-                        .output();
-                }
                 unsafe {
                     drop(Box::from_raw(self.user_ptr));
                 }
             }
         }
 
-        let _ = std::process::Command::new("hyprctl")
-            .args(["output", "remove", "FRAME-V1"])
-            .output();
+        let (backend, _) = compositor::detect();
+        let backend = backend.expect("Hyprland compositor");
+        let monitors = backend.list_monitors().unwrap();
+        assert!(
+            monitors.iter().all(|m| !capture::is_virtual_output_name(&m.name)),
+            "Close existing Frame Shell panels before running the live lifecycle test"
+        );
+        let anchor = monitors.iter().find(|m| m.focused).or_else(|| monitors.first()).unwrap();
+        let workspace_id = anchor.active_workspace_id;
+        let source = VirtualTargetKind::Workspace {
+            id: workspace_id,
+            name: workspace_id.to_string(),
+        };
         gstreamer::init().expect("gstreamer init");
 
         let events: Box<Mutex<Events>> = Box::default();
@@ -1049,7 +1054,7 @@ mod tests {
             });
             if let Some(id) = panel_surface
                 && guard.surfaces.contains(&id)
-                && guard.videos > 0
+                && guard.videos.contains(&id)
             {
                 created_surface = Some(id);
                 break;
@@ -1111,19 +1116,57 @@ mod tests {
         }
         assert!(closed, "expected virtual panel close and removal");
 
+        for target in [
+            source.clone(),
+            VirtualTargetKind::Blank { width: 1280, height: 720 },
+            VirtualTargetKind::Blank { width: 1280, height: 720 },
+        ] {
+            manager_ref.send(Command::Create {
+                source: target,
+                size: [1280, 720],
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut workspace_panel = None;
+        while Instant::now() < deadline {
+            let events = events_ref.lock().unwrap();
+            let panels = events.messages.iter().rev().find_map(|msg| match msg {
+                HostMessage::VirtualState(state) => Some(&state.panels),
+                _ => None,
+            });
+            if let Some(panels) = panels
+                && panels.len() == 3
+                && panels.iter().all(|panel| events.videos.contains(&panel.surface))
+            {
+                workspace_panel = Some(panels[0].surface);
+                break;
+            }
+            drop(events);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let workspace_panel = workspace_panel.expect("three rapidly requested panels streamed");
+        manager_ref.send(Command::Create { source, size: [1280, 720] });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut revealed = false;
+        while Instant::now() < deadline {
+            revealed = events_ref.lock().unwrap().messages.iter().any(|msg| {
+                matches!(msg, HostMessage::RevealVirtualPanel(surface) if *surface == workspace_panel)
+            });
+            if revealed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(revealed, "an existing workspace panel should reopen at the panel limit");
+
         guard.output.take().unwrap().stop();
         guard.manager.take().unwrap().send(Command::Shutdown);
         guard.handle.take().unwrap().join().expect("join virtual worker");
-        let (backend, _) = compositor::detect();
-        if let Some(backend) = backend {
-            let leftover: Vec<_> = backend
-                .list_monitors()
-                .unwrap()
-                .into_iter()
-                .filter(|m| capture::is_virtual_output_name(&m.name))
-                .collect();
-            assert!(leftover.is_empty(), "leftover virtual outputs: {leftover:?}");
-        }
+        let remaining = backend.list_monitors().unwrap();
+        assert!(remaining.iter().all(|m| !capture::is_virtual_output_name(&m.name)));
+        assert!(backend.list_workspaces().unwrap().iter().any(|ws| {
+            ws.id == workspace_id && ws.monitor_name == anchor.name
+        }), "the shared workspace should return to its original monitor");
         drop(guard);
     }
 }

@@ -48,6 +48,8 @@ pub enum HostMessage {
 	VirtualState(VirtualState),
 	/// Available windows and workspaces that can be placed onto a virtual panel
 	VirtualTargets(VirtualTargets),
+	/// Reveal the existing panel when its target is selected again.
+	RevealVirtualPanel(u32),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -161,6 +163,8 @@ pub struct VirtualPanelInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualWindowTarget {
+	#[serde(default)]
+	pub already_shared: bool,
 	pub address: String,
 	pub title: String,
 	pub app_id: String,
@@ -171,6 +175,8 @@ pub struct VirtualWindowTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualWorkspaceTarget {
+	#[serde(default)]
+	pub already_shared: bool,
 	pub id: i32,
 	pub name: String,
 	pub monitor: String,
@@ -347,6 +353,7 @@ mod tests {
 
 		let targets = HostMessage::VirtualTargets(VirtualTargets {
 			windows: vec![VirtualWindowTarget {
+				already_shared: true,
 				address: "0x1234".into(),
 				title: "Editor".into(),
 				app_id: "code".into(),
@@ -355,6 +362,7 @@ mod tests {
 				monitor: "DP-4".into(),
 			}],
 			workspaces: vec![VirtualWorkspaceTarget {
+				already_shared: false,
 				id: 2,
 				name: "2".into(),
 				monitor: "DP-4".into(),
@@ -363,7 +371,14 @@ mod tests {
 		});
 		assert!(matches!(
 			HostMessage::decode(&targets.encode()).expect("decode VirtualTargets"),
-			HostMessage::VirtualTargets(ref t) if t.windows.len() == 1 && t.workspaces.len() == 1
+			HostMessage::VirtualTargets(ref t)
+				if t.windows[0].already_shared && !t.workspaces[0].already_shared
+		));
+
+		let reveal = HostMessage::RevealVirtualPanel(VIRTUAL_SURFACE_BASE);
+		assert!(matches!(
+			HostMessage::decode(&reveal.encode()).expect("decode RevealVirtualPanel"),
+			HostMessage::RevealVirtualPanel(VIRTUAL_SURFACE_BASE)
 		));
 
 		let shell_msgs = [

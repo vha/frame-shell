@@ -496,9 +496,7 @@ impl<T> TabWivrn<T> {
 		let Some(source) = host.source else {
 			return Ok(());
 		};
-		let Some(caps) = host.virtual_state.get("capabilities").filter(|v| v.is_object()) else {
-			return Ok(());
-		};
+		let caps = &host.virtual_state["capabilities"];
 		let supported = flag(caps, "supported");
 		let max_panels = caps.get("max_panels").and_then(Value::as_u64).unwrap_or(0);
 		let panels = host
@@ -518,7 +516,11 @@ impl<T> TabWivrn<T> {
 			let reason = caps
 				.get("reason")
 				.and_then(Value::as_str)
-				.unwrap_or("Virtual panels currently require Hyprland.");
+				.unwrap_or(if caps.is_object() {
+					"Virtual panels are unavailable on this PC."
+				} else {
+					"The PC server does not report virtual panel support."
+				});
 			params.insert("show_status", "flex");
 			params.insert("show_controls", "none");
 			params.insert("status_text", reason);
@@ -590,11 +592,13 @@ impl<T> TabWivrn<T> {
 				let raw = if title.is_empty() { app_id } else { title };
 				let short: String = raw.chars().take(48).collect();
 				let mut row_params = TemplateParams::new();
-				row_params.insert_str("label", format!("{short} [{monitor}]"));
+				let already_shared = flag(win, "already_shared");
+				let label = if already_shared { format!("Show {short}") } else { short };
+				row_params.insert_str("label", format!("{label} [{monitor}]"));
 				row_params.insert("tooltip", &raw);
 				let row = self.template(layout, globals, "VirtualTargetRow", windows_parent, row_params)?;
 				let btn = self.button(row, "btn_add")?;
-				btn.set_enabled(&mut layout.common(), !at_cap);
+				btn.set_enabled(&mut layout.common(), !at_cap || already_shared);
 				btn.on_click(self.tasks.get_button_click_callback(Task::Command(format!(
 					"virtual_create_window {source} {address}"
 				))));
@@ -611,12 +615,14 @@ impl<T> TabWivrn<T> {
 				let monitor = text(ws, "monitor");
 				let win_count = ws.get("windows").and_then(Value::as_u64).unwrap_or(0);
 				let mut row_params = TemplateParams::new();
-				let label = format!("Workspace {name} ({win_count} win) [{monitor}]");
+				let already_shared = flag(ws, "already_shared");
+				let kind = if already_shared { "Show workspace" } else { "Workspace" };
+				let label = format!("{kind} {name} ({win_count} win) [{monitor}]");
 				row_params.insert("label", &label);
 				row_params.insert("tooltip", &label);
 				let row = self.template(layout, globals, "VirtualTargetRow", workspaces_parent, row_params)?;
 				let btn = self.button(row, "btn_add")?;
-				btn.set_enabled(&mut layout.common(), !at_cap);
+				btn.set_enabled(&mut layout.common(), !at_cap || already_shared);
 				btn.on_click(self.tasks.get_button_click_callback(Task::Command(format!(
 					"virtual_create_workspace {source} {id}"
 				))));

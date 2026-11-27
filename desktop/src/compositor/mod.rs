@@ -78,6 +78,7 @@ pub trait CompositorBackend: Send + Sync {
     fn create_headless_output(&self, name: &str) -> Result<()>;
     fn configure_outputs(&self, updates: &[wlr_output::OutputConfigUpdate]) -> Result<()>;
     fn remove_output(&self, name: &str) -> Result<()>;
+    fn focus_output(&self, name: &str) -> Result<()>;
     fn move_window_to_workspace(&self, address: &str, workspace_target: &str) -> Result<()>;
     fn move_workspace_to_output(&self, workspace_id: i32, output: &str) -> Result<()>;
     fn subscribe_events(&self, tx: Sender<CompositorEvent>, stop: Arc<AtomicBool>) -> Result<()>;

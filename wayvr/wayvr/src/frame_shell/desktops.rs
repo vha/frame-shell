@@ -280,6 +280,18 @@ pub fn poll_surfaces(app: &mut AppState) {
             }
         }
     }
+    for (source, surface) in crate::frame_host::take_virtual_reveals() {
+        if let Some(name) = surfaces()
+            .get(&surface_key(source, surface))
+            .filter(|surface| surface.spawned > 0)
+            .map(|surface| surface.name.clone())
+        {
+            app.tasks.enqueue(TaskType::Overlay(OverlayTask::ToggleOverlay(
+                OverlaySelector::Name(name),
+                crate::backend::task::ToggleMode::EnsureOn,
+            )));
+        }
+    }
     for error in crate::frame_host::take_errors() {
         toast(app, error);
     }

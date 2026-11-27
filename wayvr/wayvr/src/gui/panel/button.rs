@@ -252,13 +252,13 @@ fn virtual_menu_cell(
 
 fn build_virtual_panel_cells(source: u32) -> Result<Vec<wgui::windowing::context_menu::Cell>, String> {
     let Some(vstate) = crate::frame_host::virtual_state(source) else {
-        return Err("Virtual panel state is not available yet".into());
+        return Err("The PC server does not report virtual panel support.".into());
     };
     if !vstate.capabilities.supported {
         return Err(vstate
             .capabilities
             .reason
-            .unwrap_or_else(|| "Virtual panels require Hyprland".into()));
+            .unwrap_or_else(|| "Virtual panels are unavailable on this PC.".into()));
     }
     crate::frame_shell::virtual_refresh(source);
 
@@ -285,39 +285,42 @@ fn build_virtual_panel_cells(source: u32) -> Result<Vec<wgui::windowing::context
                 true,
             ));
         }
+    }
 
-        if let Some(targets) = crate::frame_host::virtual_targets(source) {
-            if !targets.windows.is_empty() {
-                cells.push(wgui::windowing::context_menu::Cell::Separator);
-                for win in targets.windows.into_iter().take(64) {
-                    let raw = if !win.title.is_empty() {
-                        win.title.clone()
-                    } else {
-                        win.app_id.clone()
-                    };
-                    let label = format!("Window: {} [{}]", truncate_label(&raw, 36), win.monitor);
-                    cells.push(virtual_menu_cell(
-                        label,
-                        Some(raw),
-                        format!("::FrameShellVirtualCreate {source} window {}", win.address),
-                        true,
-                    ));
-                }
+    if let Some(mut targets) = crate::frame_host::virtual_targets(source) {
+        if active >= max_panels {
+            targets.windows.retain(|window| window.already_shared);
+            targets.workspaces.retain(|workspace| workspace.already_shared);
+        }
+        if !targets.windows.is_empty() {
+            cells.push(wgui::windowing::context_menu::Cell::Separator);
+            for win in targets.windows.into_iter().take(64) {
+                let raw = if !win.title.is_empty() {
+                    win.title.clone()
+                } else {
+                    win.app_id.clone()
+                };
+                let kind = if win.already_shared { "Show window" } else { "Window" };
+                let label = format!("{kind}: {} [{}]", truncate_label(&raw, 36), win.monitor);
+                cells.push(virtual_menu_cell(
+                    label,
+                    Some(raw),
+                    format!("::FrameShellVirtualCreate {source} window {}", win.address),
+                    true,
+                ));
             }
-            if !targets.workspaces.is_empty() {
-                cells.push(wgui::windowing::context_menu::Cell::Separator);
-                for ws in targets.workspaces.into_iter().take(32) {
-                    let label = format!(
-                        "Workspace {} ({} win) [{}]",
-                        ws.name, ws.windows, ws.monitor
-                    );
-                    cells.push(virtual_menu_cell(
-                        label,
-                        None,
-                        format!("::FrameShellVirtualCreate {source} workspace {}", ws.id),
-                        true,
-                    ));
-                }
+        }
+        if !targets.workspaces.is_empty() {
+            cells.push(wgui::windowing::context_menu::Cell::Separator);
+            for ws in targets.workspaces.into_iter().take(32) {
+                let kind = if ws.already_shared { "Show workspace" } else { "Workspace" };
+                let label = format!("{kind} {} ({} win) [{}]", ws.name, ws.windows, ws.monitor);
+                cells.push(virtual_menu_cell(
+                    label,
+                    None,
+                    format!("::FrameShellVirtualCreate {source} workspace {}", ws.id),
+                    true,
+                ));
             }
         }
     }
@@ -384,11 +387,20 @@ pub(super) fn setup_custom_button<S: 'static>(
                                 return Ok(EventResult::Pass);
                             }
 
+                            let mut template_params = template_params.clone();
+                            if template_name.as_ref() == "menu_burger" {
+                                let hide = !crate::frame_shell::EMBEDDED.load(Ordering::Relaxed)
+                                    || crate::frame_shell::virtual_supported_sources().is_empty();
+                                template_params.insert(
+                                    "no_virtual_panels",
+                                    if hide { "1" } else { "0" },
+                                );
+                            }
                             context_menu.borrow_mut().open(OpenParams {
                                 on_custom_attribs: Some(on_custom_attribs.clone()),
                                 blueprint: Blueprint::Template {
                                     template_name: template_name.clone(),
-                                    template_params: template_params.clone(),
+                                    template_params,
                                 },
                                 position: data.metadata.get_mouse_pos_absolute().unwrap().into(), // want panic
                             });
@@ -940,7 +952,7 @@ pub(super) fn setup_custom_button<S: 'static>(
                                         ToastTopic::System,
                                         Some(Translation::from_raw_text("Virtual panels")),
                                         Translation::from_raw_text(
-                                            "No connected PC supports virtual panels (requires Hyprland)",
+                                            "No connected PC reports virtual panel support.",
                                         ),
                                     )
                                     .with_timeout(2.5)

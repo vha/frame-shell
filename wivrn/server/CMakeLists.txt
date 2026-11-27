@@ -226,7 +226,7 @@ if (WIVRN_BUILD_SERVER)
 	if(NOT FRAME_HOST_LIBRARY)
 		message(FATAL_ERROR "Set FRAME_HOST_LIBRARY to libframe_host.a")
 	endif()
-	pkg_check_modules(FRAME_HOST REQUIRED IMPORTED_TARGET gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 dbus-1 xkbcommon libpipewire-0.3)
+	pkg_check_modules(FRAME_HOST REQUIRED IMPORTED_TARGET gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 gstreamer-allocators-1.0 gstreamer-video-1.0 gbm dbus-1 xkbcommon libpipewire-0.3)
 	target_include_directories(wivrn-server PRIVATE ${FRAME_ABI_INCLUDE_DIR})
 	# Needs the packets' OpenXR types, which wivrn-common is built without
 	target_sources(wivrn-server PRIVATE ../common/fec.cpp ../common/shard_stream.cpp)
