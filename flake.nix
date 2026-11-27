@@ -50,7 +50,7 @@
       pname = "wayvrctl";
       version = "0.1.0";
       src = ./wayvr;
-      cargoHash = "sha256-GquObI1uN24oq4bvMOvxIzX5Wb1kh/ecVYv7c6Vc1zY=";
+      cargoHash = "sha256-SymBvzODM314e7k8p7aSbu89MsBVgrixZW0jPc86QCI=";
       cargoBuildFlags = ["--package" "wayvrctl"];
       doCheck = false;
     };

@@ -66,22 +66,12 @@ pub(crate) extern "C" fn desktop_frame(frame: *const DesktopFrame) {
     };
     let key = surface_key(frame.source, frame.surface);
     // A newer frame replaces one that wasn't shown yet
-    let (replaced, accepted_virtual) = match surfaces().get_mut(&key) {
-        Some(surface) => (
-            surface.frame.replace((*frame, fd)).map(|(old, _)| old.id),
-            surface.virtual_panel,
-        ),
-        None => (Some(frame.id), false),
+    let replaced = match surfaces().get_mut(&key) {
+        Some(surface) => surface.frame.replace((*frame, fd)).map(|(old, _)| old.id),
+        None => Some(frame.id),
     };
     if let Some(id) = replaced {
         release_frame(id);
-    }
-    if accepted_virtual {
-        crate::frame_host::virtual_resize_decoded(
-            frame.source,
-            frame.surface,
-            [frame.width, frame.height],
-        );
     }
 }
 
@@ -775,7 +765,12 @@ impl OverlayBackend for DesktopOverlay {
         self.renderer
             .as_mut()
             .unwrap()
-            .render(luma, chroma, app, resources)
+            .render(luma, chroma, app, resources)?;
+        let surface = self.key as u32;
+        if wayvr_ipc::frame::is_virtual_surface(surface) && let Some(meta) = self.meta {
+            crate::frame_host::virtual_frame_rendered((self.key >> 32) as u32, surface, meta.extent);
+        }
+        Ok(())
     }
     fn frame_meta(&mut self) -> Option<FrameMeta> {
         match &mut self.offline {

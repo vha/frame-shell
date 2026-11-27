@@ -249,7 +249,7 @@ pub fn receive(source: u32, data: &[u8]) {
     sync_presentation();
 }
 
-pub fn virtual_resize_decoded(source: u32, surface: u32, size: [u32; 2]) {
+pub fn virtual_frame_rendered(source: u32, surface: u32, size: [u32; 2]) {
     let serial = {
         let mut state = state();
         let Some(pc) = state.pcs.get_mut(&source) else {
