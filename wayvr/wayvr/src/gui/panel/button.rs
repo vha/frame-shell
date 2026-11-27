@@ -289,7 +289,7 @@ fn build_virtual_panel_cells(source: u32) -> Result<Vec<wgui::windowing::context
         if let Some(targets) = crate::frame_host::virtual_targets(source) {
             if !targets.windows.is_empty() {
                 cells.push(wgui::windowing::context_menu::Cell::Separator);
-                for win in targets.windows.into_iter().take(10) {
+                for win in targets.windows.into_iter().take(64) {
                     let raw = if !win.title.is_empty() {
                         win.title.clone()
                     } else {
@@ -306,7 +306,7 @@ fn build_virtual_panel_cells(source: u32) -> Result<Vec<wgui::windowing::context
             }
             if !targets.workspaces.is_empty() {
                 cells.push(wgui::windowing::context_menu::Cell::Separator);
-                for ws in targets.workspaces.into_iter().take(8) {
+                for ws in targets.workspaces.into_iter().take(32) {
                     let label = format!(
                         "Workspace {} ({} win) [{}]",
                         ws.name, ws.windows, ws.monitor
