@@ -128,7 +128,8 @@ dofile("/path/to/frame-shell/scripts/hyprland-detach.lua")("SUPER + mouse:272", 
 
 Drag toward an edge that opens onto empty space. Pause near the edge until **Drop to create panel** and the
 VR outline appear, then release the mouse button to detach. Pull back to cancel or cross an edge that connects
-to another output to move the app there normally. The new panel fits to the window at creation. A previously
+to another output to move the app there normally. The new panel fits to the window, faces the headset, and
+starts at the same distance as its parent output. A previously
 tiled window floats on its own panel and returns to tiling when the panel closes.
 
 Store optional PC picker defaults in `${XDG_CONFIG_HOME:-~/.config}/frame-shell/virtual-panels.json`.

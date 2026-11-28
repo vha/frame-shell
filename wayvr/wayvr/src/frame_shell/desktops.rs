@@ -135,8 +135,6 @@ pub fn detach_pose<T>(
     source: u32,
     placement: &wayvr_ipc::virtual_panel::DetachPlacement,
 ) -> (glam::Affine3A, glam::Vec2) {
-    use wayvr_ipc::virtual_panel::DropEdge;
-
     let state = crate::frame_host::virtual_state(source);
     let parent_name = state
         .as_ref()
@@ -159,18 +157,34 @@ pub fn detach_pose<T>(
                 .map(|state| overlay.config.surface_transform(state.transform))
         })
     });
-    let [w, h] = placement.size.map(|dimension| dimension.max(1) as f32);
-    let mut pose = anchor.unwrap_or_else(|| {
+    let anchor = anchor.unwrap_or_else(|| {
         app.input_state.hmd * glam::Affine3A::from_translation(glam::vec3(0.0, 0.0, -1.5))
     });
+    detached_panel_pose(
+        anchor,
+        &app.input_state.hmd,
+        app.session.config.snap_angle_deg,
+        placement,
+    )
+}
+
+fn detached_panel_pose(
+    anchor: glam::Affine3A,
+    headset: &glam::Affine3A,
+    snap_angle: f32,
+    placement: &wayvr_ipc::virtual_panel::DetachPlacement,
+) -> (glam::Affine3A, glam::Vec2) {
+    use wayvr_ipc::virtual_panel::DropEdge;
+
+    let [w, h] = placement.size.map(|dimension| dimension.max(1) as f32);
     let [anchor_w, anchor_h] = placement
         .anchor_size
         .map(|dimension| dimension.max(1) as f32);
-    let density = pose.x_axis.length().max(0.1) / anchor_w.max(anchor_h);
+    let density = anchor.x_axis.length().max(0.1) / anchor_w.max(anchor_h);
     let major = (w.max(h) * density).clamp(0.3, 3.0);
     let dimensions = glam::vec2(w, h) * (major / w.max(h));
-    let right = pose.x_axis.normalize_or_zero();
-    let up = pose.y_axis.normalize_or_zero();
+    let right = anchor.x_axis.normalize_or_zero();
+    let up = anchor.y_axis.normalize_or_zero();
     let across = placement.offset as f32 * density;
     let horizontal = (anchor_w * density + dimensions.x) * 0.5 + 0.04;
     let vertical = (anchor_h * density + dimensions.y) * 0.5 + 0.04;
@@ -180,8 +194,23 @@ pub fn detach_pose<T>(
         DropEdge::Top => (across, vertical),
         DropEdge::Bottom => (across, -vertical),
     };
-    pose.translation += right * x + up * y;
-    pose.matrix3 = glam::Mat3A::from_cols(right, up, right.cross(up)).mul_scalar(major);
+    let offset = right * x + up * y;
+    let mut pose = glam::Affine3A {
+        matrix3: glam::Mat3A::from_cols(right, up, right.cross(up)).mul_scalar(major),
+        translation: anchor.translation + offset,
+    };
+    let from_headset = anchor.translation - headset.translation;
+    if let Some(radial) = from_headset.try_normalize()
+        && let Some(tangent) = (offset - radial * offset.dot(radial)).try_normalize()
+    {
+        // Follow the parent's depth around the headset, using the requested
+        // edge spacing as arc length rather than moving along the flat panel.
+        let radius = from_headset.length();
+        let angle = (offset.length() / radius).min(std::f32::consts::FRAC_PI_2);
+        let (sin, cos) = angle.sin_cos();
+        pose.translation = headset.translation + radius * (radial * cos + tangent * sin);
+    }
+    realign(&mut pose, headset, major, snap_angle);
     (pose, dimensions)
 }
 
@@ -980,6 +1009,36 @@ impl OverlayBackend for DesktopOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_panel_faces_the_headset_at_its_parents_depth() {
+        use wayvr_ipc::virtual_panel::{DetachPlacement, DropEdge};
+
+        let headset = glam::Affine3A::from_translation(glam::vec3(0.3, 1.5, 0.1));
+        let mut anchor = glam::Affine3A::from_translation(glam::vec3(-0.5, 1.35, -1.7));
+        realign(&mut anchor, &headset, 1.5, 0.0);
+        for (edge, direction) in [
+            (DropEdge::Right, anchor.x_axis),
+            (DropEdge::Left, -anchor.x_axis),
+            (DropEdge::Top, anchor.y_axis),
+            (DropEdge::Bottom, -anchor.y_axis),
+        ] {
+            let placement = DetachPlacement {
+                anchor: "parent".into(),
+                anchor_size: [1600, 900],
+                edge,
+                size: [1200, 800],
+                offset: 120,
+            };
+            let (pose, dimensions) = detached_panel_pose(anchor, &headset, 0.0, &placement);
+            let radius = anchor.translation.distance(headset.translation);
+            let to_headset = headset.translation - pose.translation;
+            assert!((to_headset.length() - radius).abs() < 1e-5);
+            assert!(pose.z_axis.normalize().dot(to_headset.normalize()) > 0.9999);
+            assert!((pose.translation - anchor.translation).dot(direction) > 0.0);
+            assert!((pose.x_axis.length() - dimensions.max_element()).abs() < 1e-5);
+        }
+    }
 
     #[test]
     fn virtual_desktop_keeps_pixel_density_as_either_edge_grows() {

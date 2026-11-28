@@ -1153,7 +1153,12 @@ impl<T> OverlayWindowManager<T> {
                 let config = &mut self.overlays[oid].config;
                 if let Some(state) = config.active_state.as_mut() {
                     state.transform = pose;
-                    save_transform(state, app);
+                    if matches!(state.positioning, wlx_common::windowing::Positioning::Anchored) {
+                        // Anchored overlays use the full set transform each frame.
+                        state.saved_transform = Some(app.anchor.inverse() * pose);
+                    } else {
+                        save_transform(state, app);
+                    }
                 }
                 config.dirty = true;
                 crate::frame_shell::layout_changed();
