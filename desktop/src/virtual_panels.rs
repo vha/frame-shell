@@ -1908,7 +1908,8 @@ mod tests {
                         }
                         assert!(
                             Instant::now() < deadline,
-                            "window drag ({delta}) did not move the panel"
+                            "window drag ({delta}) did not move the panel: {:?}, pointer {:?}",
+                            backend.list_windows(), backend.cursor_position()
                         );
                         drop(events);
                         std::thread::sleep(Duration::from_millis(25));

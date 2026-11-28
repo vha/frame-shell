@@ -57,15 +57,23 @@ pub(super) struct WindowFollow {
     motion: Option<Motion>,
 }
 
+pub(super) enum Movement {
+    Idle,
+    Moving,
+    Settled([i32; 2]),
+}
+
 impl WindowFollow {
     pub fn observe(
         &mut self,
         window: &WindowInfo,
         cursor: [i32; 2],
         now: Instant,
-    ) -> Option<[i32; 2]> {
+    ) -> Movement {
         let current = Sample::new(window, cursor, now);
-        let previous = self.previous.replace(current)?;
+        let Some(previous) = self.previous.replace(current) else {
+            return Movement::Idle;
+        };
         if current.size != previous.size || !current.cursor_on_window() {
             self.motion = None;
         } else if current.position != previous.position {
@@ -85,16 +93,20 @@ impl WindowFollow {
             motion.last_motion = now;
         }
 
-        if self
-            .motion
-            .as_ref()
-            .is_some_and(|motion| now.duration_since(motion.last_motion) >= SETTLE)
-        {
-            let motion = self.motion.take()?;
+        let Some(motion) = &self.motion else {
+            return Movement::Idle;
+        };
+        if now.duration_since(motion.last_motion) >= SETTLE {
             let movement = delta(current.position, motion.start);
-            return (movement != [0, 0]).then_some(movement);
+            self.motion = None;
+            if movement == [0, 0] {
+                Movement::Idle
+            } else {
+                Movement::Settled(movement)
+            }
+        } else {
+            Movement::Moving
         }
-        None
     }
 
     pub fn crossed(&self, window: &WindowInfo, cursor: [i32; 2], now: Instant) -> Option<[i32; 2]> {

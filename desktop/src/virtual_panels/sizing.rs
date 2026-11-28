@@ -8,7 +8,7 @@ use wayvr_ipc::virtual_panel::{SIZE_REQUIREMENTS, Sizing, normalized_size, valid
 
 use super::{
     ActivePanel, PanelOwnership, Worker, preserve_cursor, to_output_geos,
-    window_follow::WindowFollow,
+    window_follow::{Movement, WindowFollow},
 };
 use crate::{
     capture::is_virtual_output_name,
@@ -236,21 +236,25 @@ impl Worker {
                     continue;
                 }
             };
-            if fit.settle_until.is_none() && size == output_size {
-                if let (Some(cursor), Some(monitor)) = (cursor, monitor)
-                    && let Some(delta) = fit.movement.observe(window, cursor, now)
-                {
-                    if let Ok(pos) = recenter(backend.as_ref(), monitor, window, border) {
-                        preserve_cursor(backend.as_ref(), monitor, cursor, window.pos, pos);
-                        self.output
-                            .send(&wayvr_ipc::frame::HostMessage::VirtualWindowMoved {
-                                surface: id,
-                                delta,
-                                output_size,
-                            });
+            if let (None, Some(cursor), Some(monitor)) = (fit.settle_until, cursor, monitor) {
+                // A fit can be pending or blocked by the layout. Track the
+                // drag at the current mode and defer fitting until it settles.
+                match fit.movement.observe(window, cursor, now) {
+                    Movement::Idle => {}
+                    Movement::Moving => continue,
+                    Movement::Settled(delta) => {
+                        if let Ok(pos) = recenter(backend.as_ref(), monitor, window, border) {
+                            preserve_cursor(backend.as_ref(), monitor, cursor, window.pos, pos);
+                            self.output
+                                .send(&wayvr_ipc::frame::HostMessage::VirtualWindowMoved {
+                                    surface: id,
+                                    delta,
+                                    output_size,
+                                });
+                        }
+                        fit.movement = WindowFollow::default();
+                        continue;
                     }
-                    fit.movement = WindowFollow::default();
-                    continue;
                 }
             } else {
                 fit.movement = WindowFollow::default();
@@ -595,13 +599,23 @@ pub(super) fn recenter(
     window: &WindowInfo,
     border: u32,
 ) -> Result<[i32; 2]> {
-    let [left, top, right, bottom] = monitor.reserved;
     let (x, y) = monitor.logical_pos;
     let (w, h) = monitor.logical_size;
-    let pos = [
-        x + left + ((w - left - right - window.size[0] as i32) / 2).max(border as i32),
-        y + top + ((h - top - bottom - window.size[1] as i32) / 2).max(border as i32),
-    ];
+    let origin = [x, y];
+    let extent = [w, h];
+    let border = border as i32;
+    let pos = std::array::from_fn(|axis| {
+        let leading = monitor.reserved[axis];
+        let available = extent[axis] - leading - monitor.reserved[axis + 2];
+        let window_len = window.size[axis] as i32;
+        // Use the full output if honoring its reserved area would clip the app.
+        let (offset, length) = if available >= window_len + 2 * border {
+            (leading, available)
+        } else {
+            (0, extent[axis])
+        };
+        origin[axis] + offset + ((length - window_len) / 2).max(border)
+    });
     backend.move_floating_window(&window.address, pos)?;
     Ok(pos)
 }
