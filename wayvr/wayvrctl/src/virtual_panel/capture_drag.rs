@@ -37,7 +37,7 @@ struct Capture {
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     keyboard_focus: bool,
-    pointer_focus: bool,
+    pointer_enter: Option<u32>,
     locked: bool,
     left_down: bool,
     shifts: [bool; 2],
@@ -249,8 +249,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Capture {
         qh: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Enter { .. } => state.pointer_focus = true,
-            wl_pointer::Event::Leave { .. } if state.pointer_focus => state.cancel(),
+            wl_pointer::Event::Enter { serial, .. } => state.pointer_enter = Some(serial),
+            wl_pointer::Event::Leave { .. } => {
+                if state.pointer_enter.take().is_some() {
+                    state.cancel();
+                }
+            }
             wl_pointer::Event::Button {
                 button: 272,
                 state: WEnum::Value(button),
@@ -305,7 +309,12 @@ impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for Capture {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwp_locked_pointer_v1::Event::Locked => state.locked = true,
+            zwp_locked_pointer_v1::Event::Locked => {
+                state.locked = true;
+                if let (Some(pointer), Some(serial)) = (&state.pointer, state.pointer_enter) {
+                    pointer.set_cursor(serial, None, 0, 0);
+                }
+            }
             zwp_locked_pointer_v1::Event::Unlocked if state.completed.is_none() => state.cancel(),
             _ => {}
         }
@@ -512,10 +521,14 @@ mod tests {
             ));
             buttons(true);
             thread::sleep(Duration::from_millis(100));
-            pointer.motion(10, 45.0, -30.0);
-            pointer.frame();
-            conn.flush().unwrap();
-            thread::sleep(Duration::from_millis(100));
+            // Move farther than the distance from the center of the nested
+            // output to its edge while the cursor is locked in place.
+            for step in 0..24 {
+                pointer.motion(10 + step * 25, 100.0, -4.0);
+                pointer.frame();
+                conn.flush().unwrap();
+                thread::sleep(Duration::from_millis(25));
+            }
             if cancel {
                 assert!(
                     Command::new("wtype")
@@ -529,11 +542,17 @@ mod tests {
             }
             buttons(false);
             assert_eq!(capture.join().unwrap().unwrap(), !cancel);
-            assert!(
-                std::iter::from_fn(|| rx.try_recv().ok()).any(|request| matches!(request,
-                    Request::DragMotion { translation: [dx, dy, _], .. } if dx > 0.0 && dy > 0.0
-                ))
-            );
+            let [dx, dy] =
+                std::iter::from_fn(|| rx.try_recv().ok()).fold([0.0, 0.0], |[x, y], request| {
+                    match request {
+                        Request::DragMotion {
+                            translation: [dx, dy, _],
+                            ..
+                        } => [x + dx, y + dy],
+                        _ => [x, y],
+                    }
+                });
+            assert!(dx > 3.0 && dy > 0.0, "long drag delivered [{dx}, {dy}]");
         }
 
         // A normal click after teardown must go to the underlying application.

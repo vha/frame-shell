@@ -227,6 +227,14 @@ pub fn poll_window_moves<T: Default>(
         let transform = &mut state.transform;
         transform.translation +=
             (transform.x_axis * dx - transform.y_axis * dy).clamp_length_max(3.0);
+        let scale = scalar_scale(transform);
+        realign(
+            transform,
+            &app.input_state.hmd,
+            scale,
+            app.session.config.snap_angle_deg,
+        );
+        save_transform(state, app);
         overlay.config.dirty = true;
         layout_changed();
     }

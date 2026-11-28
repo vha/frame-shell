@@ -426,7 +426,9 @@ pub fn realign(transform: &mut Affine3A, hmd: &Affine3A, scale: f32, snap_angle:
         rotation = Mat3A::from_euler(EulerRot::YXZ, yaw, pitch, roll);
     }
 
-    transform.matrix3 = rotation.mul_scalar(scale);
+    if rotation.is_finite() {
+        transform.matrix3 = rotation.mul_scalar(scale);
+    }
 }
 
 pub fn scalar_scale(a: &Affine3A) -> f32 {
@@ -437,7 +439,7 @@ pub fn scalar_scale(a: &Affine3A) -> f32 {
         / 3.0
 }
 
-pub fn save_transform(state: &mut OverlayWindowState, app: &mut AppState) {
+pub fn save_transform(state: &mut OverlayWindowState, app: &AppState) {
     let parent_transform = match state.positioning {
         Positioning::Floating => snap_upright(app.input_state.hmd, Vec3A::Y),
         Positioning::FollowHead { .. } => app.input_state.hmd,

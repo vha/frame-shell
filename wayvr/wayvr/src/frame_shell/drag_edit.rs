@@ -5,7 +5,11 @@ use glam::Affine3A;
 use crate::{
     frame_host,
     state::AppState,
-    windowing::{OverlayID, manager::OverlayWindowManager},
+    windowing::{
+        OverlayID,
+        manager::OverlayWindowManager,
+        window::{realign, save_transform, scalar_scale},
+    },
 };
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -39,9 +43,13 @@ pub fn begin<T: Default>(
     {
         return Err("Another panel grab is in progress.".into());
     }
-    let state = overlays
+    let config = &mut overlays
         .mut_by_id(overlay)
-        .and_then(|o| o.config.active_state.as_ref())
+        .ok_or("The panel has closed.")?
+        .config;
+    let state = config
+        .active_state
+        .as_ref()
         .filter(|state| state.alpha > 0.05 && state.grabbable)
         .ok_or("Show the movable panel before dragging it.")?;
     app.panel_drag = Some(Drag {
@@ -52,6 +60,7 @@ pub fn begin<T: Default>(
         original: state.transform,
         updated: Instant::now(),
     });
+    config.pause_movement = true;
     super::toast(
         app,
         "Hold the left mouse button to move the panel. Escape cancels.".into(),
@@ -94,6 +103,13 @@ pub fn motion<T: Default>(
             translation,
             scale_steps,
         );
+        let scale = scalar_scale(&state.transform);
+        realign(
+            &mut state.transform,
+            &app.input_state.hmd,
+            scale,
+            app.session.config.snap_angle_deg,
+        );
         overlay.config.dirty = true;
     }
     Ok(())
@@ -135,6 +151,12 @@ fn end<T>(app: &mut AppState, overlays: &mut OverlayWindowManager<T>, commit: bo
     let Some(drag) = app.panel_drag.take() else {
         return;
     };
+    if let Some(overlay) = overlays.mut_by_id(drag.overlay) {
+        overlay.config.pause_movement = false;
+        if commit && let Some(state) = &mut overlay.config.active_state {
+            save_transform(state, app);
+        }
+    }
     if commit {
         super::layout_changed();
     } else {

@@ -83,6 +83,8 @@ hl.bind("SUPER + ALT + V", hl.dsp.exec_cmd("wayvrctl virtual-panel drag"))
 ```
 
 Point at a virtual output and press the drag shortcut. Then hold the left mouse button and move the mouse.
+While held, the cursor is hidden and the panel can move beyond the edges of the desktop outputs.
+The panel turns to face the headset as it moves.
 Scroll while dragging for depth, hold Shift while scrolling for scale, or hold Ctrl for smaller adjustments.
 Release the mouse button to commit. Escape cancels. To move a panel when the cursor is on a physical screen,
 choose the panel in the picker and select **Drag with mouse**. The capture arms before the mouse press. Your
@@ -111,7 +113,8 @@ the fit status. Choosing a resolution switches that panel to **Fixed resolution*
 mouse edges and can shift adjacent virtual outputs to make room. If the layout has no room, move the panel first.
 
 Drag a single floating app in **Fit to window** mode with your usual window gesture to move its VR panel.
-Frame Shell follows when the window and pointer settle. **Auto-sync VR layout to desktop** snaps the virtual
+Frame Shell moves the panel and turns it toward the headset when the window and pointer settle. Use the
+drag shortcut above for moves beyond the desktop edges. **Auto-sync VR layout to desktop** snaps the virtual
 output to a valid desktop position. Resizing the app on one axis keeps the other VR dimension the same.
 
 To detach an app from its desktop, load the helper after your existing Hyprland move binding. Pass the
