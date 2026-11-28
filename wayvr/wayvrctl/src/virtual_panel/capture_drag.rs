@@ -24,6 +24,7 @@ use wayvr_ipc::virtual_panel::Request;
 type Constraints = zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
 const MOVE_BUTTON: u32 = 272;
 const RESIZE_BUTTON: u32 = 273;
+const SCROLL_SETTLE: Duration = Duration::from_millis(750);
 
 #[derive(Default)]
 struct Capture {
@@ -42,6 +43,7 @@ struct Capture {
     pointer_enter: Option<u32>,
     locked: bool,
     button_down: Option<u32>,
+    last_unheld_scroll: Option<Instant>,
     shifts: [bool; 2],
     ctrls: [bool; 2],
     pending: [f64; 3],
@@ -56,6 +58,18 @@ impl Capture {
             0.25
         } else {
             1.0
+        }
+    }
+
+    fn scroll(&mut self, value: f64) {
+        if self.button_down.is_none() {
+            self.last_unheld_scroll = Some(Instant::now());
+        }
+        let value = value * self.precision();
+        if self.shifts.iter().any(|held| *held) {
+            self.scale_steps -= value / 15.0;
+        } else {
+            self.pending[2] -= value * 0.002;
         }
     }
 
@@ -268,6 +282,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Capture {
                 wl_pointer::ButtonState::Pressed
                     if state.keyboard_focus
                         && state.button_down.is_none()
+                        && state.last_unheld_scroll.is_none()
+                        && state.completed.is_none()
                         && let (Some(constraints), Some(surface)) =
                             (&state.constraints, &state.surface) =>
                 {
@@ -290,17 +306,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Capture {
                 axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
                 value,
                 ..
-            } if state.button_down == Some(MOVE_BUTTON)
-                && state.locked
+            } if (state.button_down == Some(MOVE_BUTTON) && state.locked
+                || state.button_down.is_none() && state.keyboard_focus)
                 && state.cancel.is_none()
-                && state.completed.is_none() =>
+                && state.completed.is_none()
+                && value != 0.0 =>
             {
-                let value = value * state.precision();
-                if state.shifts.iter().any(|held| *held) {
-                    state.scale_steps -= value / 15.0;
-                } else {
-                    state.pending[2] -= value * 0.002;
-                }
+                state.scroll(value);
             }
             _ => {}
         }
@@ -426,6 +438,13 @@ pub fn run(output: &str, gain: f64, sender: &Sender<Request>) -> Result<bool> {
         if state.pending != [0.0; 3] || state.scale_steps != 0.0 {
             last_activity = Instant::now();
         }
+        if state.completed.is_none()
+            && state
+                .last_unheld_scroll
+                .is_some_and(|time| time.elapsed() >= SCROLL_SETTLE)
+        {
+            state.completed = Some(true);
+        }
         if state
             .cancel
             .is_some_and(|time| time.elapsed() >= Duration::from_secs(2))
@@ -435,6 +454,7 @@ pub fn run(output: &str, gain: f64, sender: &Sender<Request>) -> Result<bool> {
             return Ok(false);
         }
         if state.cancel.is_none()
+            && state.completed != Some(false)
             && (state.completed.is_some() || last_send.elapsed() >= Duration::from_millis(16))
         {
             let [x, y, z] = std::mem::take(&mut state.pending);
@@ -491,6 +511,19 @@ mod tests {
     };
 
     ignore_events!(ZwlrVirtualPointerManagerV1, ZwlrVirtualPointerV1);
+
+    #[test]
+    fn shift_wheel_scales_without_a_mouse_button() {
+        let mut capture = Capture {
+            shifts: [true, false],
+            ctrls: [true, false],
+            ..Default::default()
+        };
+        capture.scroll(-15.0);
+        assert_eq!(capture.scale_steps, 0.25);
+        assert_eq!(capture.pending, [0.0; 3]);
+        assert!(capture.last_unheld_scroll.is_some());
+    }
 
     #[test]
     #[ignore = "requires an isolated Hyprland session with a test window and synthetic input"]
@@ -579,6 +612,43 @@ mod tests {
                 // Arming sends an empty move heartbeat before a button is held.
                 assert!(dx > 2000.0 && dy < -80.0, "resize delivered [{dx}, {dy}]");
             }
+        }
+
+        for cancel in [false, true] {
+            let (tx, rx) = smol::channel::unbounded();
+            let output = output.clone();
+            let capture = thread::spawn(move || run(&output, 0.0015, &tx));
+            let receive = || {
+                smol::block_on(smol::future::race(
+                    async { rx.recv().await.expect("capture closed early") },
+                    async {
+                        smol::Timer::after(Duration::from_secs(2)).await;
+                        panic!("capture did not send motion");
+                    },
+                ))
+            };
+            receive(); // Wait for the armed capture's first heartbeat.
+            pointer.axis(100, wl_pointer::Axis::VerticalScroll, -15.0);
+            pointer.frame();
+            conn.flush().unwrap();
+            let Request::DragMotion {
+                translation: [0.0, 0.0, depth],
+                scale_steps,
+            } = receive()
+            else {
+                panic!("wheel did not produce panel motion");
+            };
+            assert_eq!((depth, scale_steps), (0.03, 0.0));
+            if cancel {
+                assert!(
+                    Command::new("wtype")
+                        .args(["-k", "Escape"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            assert_eq!(capture.join().unwrap().unwrap(), !cancel);
         }
 
         // A normal click after teardown must go to the underlying application.
