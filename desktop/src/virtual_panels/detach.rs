@@ -12,6 +12,7 @@ pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(60);
 const ARM_DELAY: Duration = Duration::from_millis(180);
 const TIMEOUT: Duration = Duration::from_secs(15);
 const EDGE_WIDTH: i32 = 24;
+const ARMED_EDGE_WIDTH: i32 = 36;
 const MIN_DRAG: i32 = 48;
 
 pub(super) struct Gesture {
@@ -27,6 +28,9 @@ pub(super) struct Creation {
     pub placement: DetachPlacement,
     pub position: (i32, i32),
     pub window: WindowInfo,
+    pub original_workspace: i32,
+    pub original_monitor: String,
+    pub original_position: [i32; 2],
     pub cursor: [i32; 2],
     pub border: u32,
 }
@@ -166,19 +170,30 @@ impl Worker {
         let anchor = monitors
             .iter()
             .find(|m| m.name == gesture.window.monitor_name)?;
-        if !anchor.contains(gesture.start) || !anchor.contains(cursor) {
+        if !anchor.contains(gesture.start)
+            || !anchor.contains(cursor)
+            || anchor.active_workspace_id != gesture.window.workspace_id
+        {
             return None;
         }
-        let edge = drop_edge(&monitors, anchor, gesture.start, cursor)?;
+        let armed = gesture.preview.as_ref().map(|preview| preview.edge);
+        let edge = drop_edge(&monitors, anchor, gesture.start, cursor, armed)?;
         let window = backend.list_windows().ok()?.into_iter().find(|window| {
             window.address == gesture.window.address
-                && window.workspace_id == gesture.window.workspace_id
-                && window.monitor_name == anchor.name
                 && window.floating
                 && !window.fullscreen
                 && !window.pinned
-                && window.pos != gesture.window.pos
-                && window.size == gesture.window.size
+                // Hyprland can snap the window back or assign its center to another
+                // output as the drag ends. Once armed, use the cursor to judge intent.
+                && if armed.is_some() {
+                    window.workspace_id == gesture.window.workspace_id
+                        || window.monitor_name != anchor.name
+                } else {
+                    window.workspace_id == gesture.window.workspace_id
+                        && window.monitor_name == anchor.name
+                        && window.pos != gesture.window.pos
+                        && window.size == gesture.window.size
+                }
         })?;
         let border = backend.window_border().ok()?;
         // The new output has no reserved space and runs at scale 1.
@@ -194,6 +209,9 @@ impl Worker {
             placement,
             position,
             window,
+            original_workspace: gesture.window.workspace_id,
+            original_monitor: gesture.window.monitor_name.clone(),
+            original_position: gesture.window.pos,
             cursor,
             border,
         })
@@ -205,6 +223,7 @@ fn drop_edge(
     anchor: &MonitorGeometry,
     start: [i32; 2],
     cursor: [i32; 2],
+    armed: Option<DropEdge>,
 ) -> Option<DropEdge> {
     let (x, y) = anchor.logical_pos;
     let (w, h) = anchor.logical_size;
@@ -235,14 +254,19 @@ fn drop_edge(
         ),
     ]
     .into_iter()
-    .filter(|&(_, distance, motion, beyond)| {
-        distance < EDGE_WIDTH
+    .filter(|&(edge, distance, motion, beyond)| {
+        let width = if armed == Some(edge) {
+            ARMED_EDGE_WIDTH
+        } else {
+            EDGE_WIDTH
+        };
+        distance < width
             && motion >= MIN_DRAG
             && !monitors
                 .iter()
                 .any(|m| m.name != anchor.name && m.contains(beyond))
     })
-    .min_by_key(|&(_, distance, _, _)| distance)
+    .min_by_key(|&(edge, distance, _, _)| (armed != Some(edge), distance))
     .map(|(edge, _, _, _)| edge)
 }
 
@@ -328,14 +352,43 @@ mod tests {
             monitor("DP-2", 0, 0, 1920, 1080),
         ];
         let start = [-1000, 500];
-        assert_eq!(drop_edge(&monitors, &monitors[0], start, [-1, 500]), None);
         assert_eq!(
-            drop_edge(&monitors, &monitors[0], start, [-1919, 500]),
+            drop_edge(
+                &monitors,
+                &monitors[0],
+                start,
+                [-1, 500],
+                Some(DropEdge::Right)
+            ),
+            None
+        );
+        assert_eq!(
+            drop_edge(&monitors, &monitors[0], start, [-1919, 500], None),
             Some(DropEdge::Left)
         );
         assert_eq!(
-            drop_edge(&monitors, &monitors[0], start, [-1850, 500]),
+            drop_edge(
+                &monitors,
+                &monitors[0],
+                start,
+                [-1850, 500],
+                Some(DropEdge::Left)
+            ),
             None
+        );
+        assert_eq!(
+            drop_edge(&monitors, &monitors[0], start, [-1890, 500], None),
+            None
+        );
+        assert_eq!(
+            drop_edge(
+                &monitors,
+                &monitors[0],
+                start,
+                [-1890, 500],
+                Some(DropEdge::Left)
+            ),
+            Some(DropEdge::Left)
         );
     }
 

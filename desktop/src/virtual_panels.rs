@@ -437,7 +437,7 @@ impl Worker {
                         .find(|w| w.address == norm)
                         .context("Selected window is no longer open")?;
                     let return_monitor = if let Some(drop) = &detach {
-                        drop.window.monitor_name.clone()
+                        drop.original_monitor.clone()
                     } else if capture::is_virtual_output_name(&win.monitor_name)
                         || win.monitor_name.is_empty()
                     {
@@ -446,7 +446,7 @@ impl Worker {
                         win.monitor_name.clone()
                     };
                     let return_ws = if let Some(drop) = &detach {
-                        drop.window.workspace_id
+                        drop.original_workspace
                     } else if capture::is_virtual_output_name(&win.monitor_name) {
                         primary_phys_ws
                     } else {
@@ -526,20 +526,34 @@ impl Worker {
                 });
                 backend.configure_outputs(&config_updates)?;
 
-                let monitors_after = backend.list_monitors()?;
+                let monitors_after = if detach.is_some() {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(500);
+                    loop {
+                        let current = backend.list_monitors()?;
+                        if current.iter().any(|m| {
+                            m.name == output_name
+                                && [m.width, m.height] == [width, height]
+                                && m.logical_pos == (spawn_x, spawn_y)
+                                && m.active_workspace_id > 0
+                        }) && sizing::layout_has_no_virtual_overlaps(&current, &[])
+                        {
+                            break current;
+                        }
+                        ensure!(
+                            std::time::Instant::now() < deadline,
+                            "The compositor did not confirm a usable drop position and workspace"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                } else {
+                    backend.list_monitors()?
+                };
                 let vmon = monitors_after
                     .iter()
                     .find(|m| m.name == output_name)
                     .with_context(|| format!("Created output {output_name} missing"))?;
                 let default_ws_id = vmon.active_workspace_id.max(1);
-                if detach.is_some() {
-                    ensure!(
-                        [vmon.width, vmon.height] == [width, height]
-                            && vmon.logical_pos == (spawn_x, spawn_y)
-                            && sizing::layout_has_no_virtual_overlaps(&monitors_after, &[]),
-                        "The compositor did not confirm a usable drop position"
-                    );
-                }
 
                 match ownership {
                     PanelOwnership::Blank { .. } => Ok(PanelOwnership::Blank {
@@ -603,9 +617,9 @@ impl Worker {
                     if let Some(drop) = &detach {
                         let _ = backend.move_window_to_workspace(
                             &drop.window.address,
-                            &drop.window.workspace_id.to_string(),
+                            &drop.original_workspace.to_string(),
                         );
-                        let _ = backend.move_floating_window(&drop.window.address, drop.window.pos);
+                        let _ = backend.move_floating_window(&drop.window.address, drop.original_position);
                     }
                     let _ = backend.remove_output(&output_name);
                     if detach.is_some() {
@@ -650,9 +664,9 @@ impl Worker {
                     if let Some(drop) = &detach {
                         let _ = backend.move_window_to_workspace(
                             &drop.window.address,
-                            &drop.window.workspace_id.to_string(),
+                            &drop.original_workspace.to_string(),
                         );
-                        let _ = backend.move_floating_window(&drop.window.address, drop.window.pos);
+                        let _ = backend.move_floating_window(&drop.window.address, drop.original_position);
                         let _ = backend.remove_output(&output_name);
                         let _ = backend.configure_outputs(&pin_updates);
                     }
@@ -704,7 +718,7 @@ impl Worker {
                             });
                     if let Err(error) = self.wait_for_frame(surface, size, serial) {
                         self.close_panel(surface, true, true);
-                        let _ = backend.move_floating_window(&drop.window.address, drop.window.pos);
+                        let _ = backend.move_floating_window(&drop.window.address, drop.original_position);
                         self.output.send(&HostMessage::Error(format!(
                             "Could not stream the detached window: {error:#}"
                         )));
@@ -1561,7 +1575,23 @@ mod tests {
                     continue;
                 }
                 shared.virtual_resize_ack.store(id == 3, Ordering::Release);
-                manager_ref.send(Command::Detach(DetachGesture::Release { id, cursor: edge }));
+                let release = if id == 2 {
+                    // The native drag can end before the release reaches the host.
+                    // Simulate a compositor snap and a small pointer retreat.
+                    backend
+                        .move_floating_window(address, [x + 100, y + 40])
+                        .unwrap();
+                    let near_edge = [x + 30, edge[1]];
+                    backend.move_cursor(near_edge).unwrap();
+                    std::thread::sleep(Duration::from_millis(125));
+                    near_edge
+                } else {
+                    edge
+                };
+                manager_ref.send(Command::Detach(DetachGesture::Release {
+                    id,
+                    cursor: release,
+                }));
                 if id == 3 {
                     let deadline = Instant::now() + Duration::from_secs(6);
                     while !lock(events_ref).messages.iter().any(|event| {

@@ -1,5 +1,6 @@
 -- Load after the existing mouse move binding, using the same chord.
 return function(chord, cli)
+    local button = assert(chord:match("(mouse:%d+)%s*$"), "The detach chord must end with a mouse button")
     local id = os.time() * 1000000
     local drag
     local command = "'" .. cli:gsub("'", "'\\''") .. "' virtual-panel detach "
@@ -14,11 +15,12 @@ return function(chord, cli)
             math.floor(cursor.x), math.floor(cursor.y)))
     end)
 
-    hl.bind(chord, function()
+    hl.bind(button, function()
         if not drag then return end
         local cursor = hl.get_cursor_pos()
         hl.exec_cmd(command .. string.format("release %d %d %d", drag,
             math.floor(cursor.x), math.floor(cursor.y)))
         drag = nil
-    end, { release = true })
+    -- The user may let go of the modifier before letting go of the mouse.
+    end, { release = true, ignore_mods = true, non_consuming = true, transparent = true })
 end
