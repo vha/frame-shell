@@ -3,7 +3,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use glam::{Affine3A, Vec3A};
+use glam::{Affine3A, Vec2, Vec3A};
+use wayvr_ipc::{
+    frame::ShellMessage,
+    virtual_panel::{MAX_SIZE, MIN_SIZE, Sizing, normalized_size},
+};
 
 use crate::{
     frame_host,
@@ -24,7 +28,34 @@ pub(crate) struct Drag {
     overlay: OverlayID,
     original: Affine3A,
     orbit: Orbit,
+    resize: Option<Resize>,
     updated: Instant,
+}
+
+struct Resize {
+    original: [u32; 2],
+    pixels: [f64; 2],
+}
+
+impl Resize {
+    fn new(original: [u32; 2]) -> Self {
+        Self {
+            original,
+            pixels: original.map(f64::from),
+        }
+    }
+
+    fn apply(&mut self, delta: [f32; 2]) {
+        for (axis, pixels) in self.pixels.iter_mut().enumerate() {
+            *pixels = (*pixels + f64::from(delta[axis]))
+                .clamp(f64::from(MIN_SIZE[axis]), f64::from(MAX_SIZE[axis]));
+        }
+    }
+
+    fn proposal(&self) -> Option<[u32; 2]> {
+        let size = normalized_size(self.pixels.map(|pixels| (pixels * 0.5).round() as u32 * 2));
+        (size != self.original).then_some(size)
+    }
 }
 
 impl Drag {
@@ -108,12 +139,13 @@ pub fn begin<T: Default>(
         overlay,
         original: state.transform,
         orbit: Orbit::new(app.input_state.hmd.translation, state.transform.translation),
+        resize: None,
         updated: Instant::now(),
     });
     config.pause_movement = true;
     super::toast(
         app,
-        "Hold the left mouse button to move the panel. Escape cancels.".into(),
+        "Left-drag to move. Right-drag to resize. Escape cancels.".into(),
     );
     Ok(())
 }
@@ -130,6 +162,9 @@ pub fn motion<T: Default>(
         .as_mut()
         .filter(|drag| drag.owner == owner)
         .ok_or("This connection does not own a panel drag.")?;
+    if drag.resize.is_some() {
+        return Err("Finish resizing before moving the panel.".into());
+    }
     if translation.iter().any(|v| !v.is_finite() || v.abs() > 0.5)
         || !scale_steps.is_finite()
         || scale_steps.abs() > 6.0
@@ -168,20 +203,86 @@ pub fn motion<T: Default>(
     Ok(())
 }
 
+pub fn resize(app: &mut AppState, owner: u64, delta: [f32; 2]) -> Result<(), String> {
+    let drag = app
+        .panel_drag
+        .as_mut()
+        .filter(|drag| drag.owner == owner)
+        .ok_or("This connection does not own a panel drag.")?;
+    if delta.iter().any(|value| !value.is_finite()) {
+        return Err("Invalid panel resize motion.".into());
+    }
+    if drag.resize.is_none() {
+        let state = frame_host::virtual_state(drag.source)
+            .filter(|state| state.capabilities.resize_panel)
+            .ok_or("This PC does not support changing panel resolution.")?;
+        let panel = state
+            .panels
+            .iter()
+            .find(|panel| panel.surface == drag.surface)
+            .ok_or("The panel has closed.")?;
+        drag.resize = Some(Resize::new([panel.width, panel.height]));
+    }
+    drag.resize
+        .as_mut()
+        .expect("resize initialized")
+        .apply(delta);
+    drag.updated = Instant::now();
+    Ok(())
+}
+
+pub fn resize_preview<T>(
+    app: &AppState,
+    overlays: &OverlayWindowManager<T>,
+) -> Option<(Affine3A, Vec2)> {
+    let drag = app.panel_drag.as_ref()?;
+    let resize = drag.resize.as_ref()?;
+    let [width, height] = resize.proposal()?;
+    let (_, overlay) = overlays.iter().find(|(id, _)| *id == drag.overlay)?;
+    let state = overlay
+        .config
+        .active_state
+        .as_ref()
+        .filter(|state| state.alpha > 0.05)?;
+    let pose = overlay.config.surface_transform(state.transform);
+    let density = pose.x_axis.length() / resize.original[0].max(resize.original[1]).max(1) as f32;
+    // Put the outline just in front of the stream to avoid z-fighting.
+    let mut pose = pose;
+    pose.translation += pose.z_axis.normalize_or_zero() * 0.01;
+    Some((pose, Vec2::new(width as f32, height as f32) * density))
+}
+
 pub fn finish<T: Default>(
     app: &mut AppState,
     overlays: &mut OverlayWindowManager<T>,
     owner: u64,
     commit: bool,
 ) -> Result<(), String> {
-    if !app
+    let drag = app
         .panel_drag
         .as_ref()
-        .is_some_and(|drag| drag.owner == owner)
-    {
-        return Err("This connection does not own a panel drag.".into());
+        .filter(|drag| drag.owner == owner)
+        .ok_or("This connection does not own a panel drag.")?;
+    if let Some(resize) = &drag.resize {
+        let target = commit
+            .then(|| resize.proposal())
+            .flatten()
+            .map(|size| (drag.source, drag.surface, size));
+        end(app, overlays, false);
+        if let Some((source, surface, size)) = target
+            && !frame_host::send(
+                source,
+                &ShellMessage::SetVirtualPanelSizing {
+                    surface,
+                    sizing: Sizing::Resolution(size),
+                },
+            )
+        {
+            return Err("The PC disconnected before resizing the panel.".into());
+        }
+    } else {
+        end(app, overlays, commit);
     }
-    end(app, overlays, commit);
     Ok(())
 }
 
@@ -225,6 +326,20 @@ pub fn expire<T: Default>(app: &mut AppState, overlays: &mut OverlayWindowManage
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_keeps_even_dimensions_and_can_reverse_at_a_limit() {
+        let mut resize = Resize::new([1280, 720]);
+        assert_eq!(resize.proposal(), None);
+        resize.apply([120.0, 0.0]);
+        assert_eq!(resize.proposal(), Some([1400, 720]));
+        resize.apply([-120.0, 80.0]);
+        assert_eq!(resize.proposal(), Some([1280, 800]));
+        resize.apply([5000.0, -1000.0]);
+        assert_eq!(resize.proposal(), Some([MAX_SIZE[0], MIN_SIZE[1]]));
+        resize.apply([-2.0, 2.0]);
+        assert_eq!(resize.proposal(), Some([MAX_SIZE[0] - 2, MIN_SIZE[1] + 2]));
+    }
 
     #[test]
     fn long_drag_across_headset_keeps_distance_and_height() {

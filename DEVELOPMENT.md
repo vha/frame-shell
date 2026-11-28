@@ -86,6 +86,8 @@ Point at a virtual output and press the drag shortcut. Then hold the left mouse 
 While held, the cursor is hidden and the panel can move beyond the edges of the desktop outputs.
 The panel turns to face the headset as it moves and stays at its starting distance until you scroll.
 Scroll while dragging for depth, hold Shift while scrolling for scale, or hold Ctrl for smaller adjustments.
+Hold the right mouse button instead to resize the output. Drag right or down to add width or height.
+The outline previews the new resolution. Release to apply it. A resized window share uses **Fixed resolution**.
 Release the mouse button to commit. Escape cancels. To move a panel when the cursor is on a physical screen,
 choose the panel in the picker and select **Drag with mouse**. The capture arms before the mouse press. Your
 regular Hyprland window-drag binding can stay in place.

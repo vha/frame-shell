@@ -160,7 +160,7 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
         lines.allocate(&xr_state, &app)?,
         lines.allocate(&xr_state, &app)?,
     ];
-    let mut detach_lines = None;
+    let mut panel_outline_lines = None;
 
     let watch_id = overlays.lookup(WATCH_NAME).unwrap(); // want panic
 
@@ -439,23 +439,26 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
                 app.input_state.hmd,
             );
         }
-        if let Some((source, preview)) = crate::frame_host::detach_preview() {
-            if detach_lines.is_none() {
-                detach_lines = Some([
+        let panel_preview = crate::frame_shell::drag_edit::resize_preview(&app, &overlays)
+            .or_else(|| {
+                let (source, preview) = crate::frame_host::detach_preview()?;
+                Some(crate::frame_shell::detach_pose(&app, &overlays, source, &preview))
+            });
+        if let Some((pose, dimensions)) = panel_preview {
+            if panel_outline_lines.is_none() {
+                panel_outline_lines = Some([
                     lines.allocate(&xr_state, &app)?,
                     lines.allocate(&xr_state, &app)?,
                     lines.allocate(&xr_state, &app)?,
                     lines.allocate(&xr_state, &app)?,
                 ]);
             }
-            let (pose, dimensions) =
-                crate::frame_shell::detach_pose(&app, &overlays, source, &preview);
             let right = pose.x_axis.normalize_or_zero() * dimensions.x * 0.5;
             let up = pose.y_axis.normalize_or_zero() * dimensions.y * 0.5;
             let corners = [-right - up, right - up, right + up, -right + up]
                 .map(|offset| pose.translation + offset);
-            for (i, id) in detach_lines
-                .expect("detach preview lines")
+            for (i, id) in panel_outline_lines
+                .expect("panel preview lines")
                 .into_iter()
                 .enumerate()
             {

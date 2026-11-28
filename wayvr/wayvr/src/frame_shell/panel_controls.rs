@@ -55,6 +55,10 @@ pub(crate) fn handle_request<T: Default>(
             super::drag_edit::motion(app, overlays, connection, translation, scale_steps)?;
             return Ok(Response::Accepted);
         }
+        Request::DragResize { delta } => {
+            super::drag_edit::resize(app, connection, delta)?;
+            return Ok(Response::Accepted);
+        }
         Request::EndDrag { commit } => {
             super::drag_edit::finish(app, overlays, connection, commit)?;
             return Ok(Response::Accepted);
@@ -87,6 +91,7 @@ pub(crate) fn handle_request<T: Default>(
         Request::List
         | Request::BeginDragAtOutput { .. }
         | Request::DragMotion { .. }
+        | Request::DragResize { .. }
         | Request::Detach(_)
         | Request::EndDrag { .. } => unreachable!(),
         Request::BeginDrag { surface, .. } => {

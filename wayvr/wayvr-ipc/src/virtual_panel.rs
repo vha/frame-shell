@@ -6,8 +6,8 @@ use crate::frame::{VirtualPanelInfo, VirtualTargets};
 
 pub const DEFAULT_SIZE: [u32; 2] = [1920, 1080];
 
-const MIN_SIZE: [u32; 2] = [640, 480];
-const MAX_SIZE: [u32; 2] = [3840, 2160];
+pub const MIN_SIZE: [u32; 2] = [640, 480];
+pub const MAX_SIZE: [u32; 2] = [3840, 2160];
 
 /// Preserve the host's default and clamping behavior for existing callers.
 pub fn normalized_size(size: [u32; 2]) -> [u32; 2] {
@@ -57,6 +57,9 @@ pub enum Request {
 		source: u32,
 		surface: u32,
 		action: Action,
+	},
+	DragResize {
+		delta: [f32; 2],
 	},
 }
 

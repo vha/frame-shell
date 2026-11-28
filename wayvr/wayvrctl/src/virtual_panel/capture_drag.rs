@@ -22,6 +22,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 use wayvr_ipc::virtual_panel::Request;
 
 type Constraints = zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+const MOVE_BUTTON: u32 = 272;
+const RESIZE_BUTTON: u32 = 273;
 
 #[derive(Default)]
 struct Capture {
@@ -39,7 +41,7 @@ struct Capture {
     keyboard_focus: bool,
     pointer_enter: Option<u32>,
     locked: bool,
-    left_down: bool,
+    button_down: Option<u32>,
     shifts: [bool; 2],
     ctrls: [bool; 2],
     pending: [f64; 3],
@@ -58,7 +60,10 @@ impl Capture {
     }
 
     fn cancel(&mut self) {
-        if self.left_down {
+        if self.completed.is_some() {
+            return;
+        }
+        if self.button_down.is_some() {
             self.cancel.get_or_insert_with(Instant::now);
         } else {
             self.completed = Some(false);
@@ -256,17 +261,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Capture {
                 }
             }
             wl_pointer::Event::Button {
-                button: 272,
-                state: WEnum::Value(button),
+                button,
+                state: WEnum::Value(button_state),
                 ..
-            } => match button {
+            } if matches!(button, MOVE_BUTTON | RESIZE_BUTTON) => match button_state {
                 wl_pointer::ButtonState::Pressed
                     if state.keyboard_focus
-                        && !state.left_down
+                        && state.button_down.is_none()
                         && let (Some(constraints), Some(surface)) =
                             (&state.constraints, &state.surface) =>
                 {
-                    state.left_down = true;
+                    state.button_down = Some(button);
                     state.lock = Some(constraints.lock_pointer(
                         surface,
                         pointer,
@@ -276,8 +281,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Capture {
                         (),
                     ));
                 }
-                wl_pointer::ButtonState::Released if state.left_down => {
-                    state.left_down = false;
+                wl_pointer::ButtonState::Released if state.button_down == Some(button) => {
                     state.completed = Some(state.cancel.is_none() && state.locked);
                 }
                 _ => {}
@@ -286,7 +290,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Capture {
                 axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
                 value,
                 ..
-            } if state.locked && state.cancel.is_none() && state.completed.is_none() => {
+            } if state.button_down == Some(MOVE_BUTTON)
+                && state.locked
+                && state.cancel.is_none()
+                && state.completed.is_none() =>
+            {
                 let value = value * state.precision();
                 if state.shifts.iter().any(|held| *held) {
                     state.scale_steps -= value / 15.0;
@@ -337,7 +345,7 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Capture {
         {
             let precision = state.precision();
             state.pending[0] += dx * precision;
-            state.pending[1] -= dy * precision;
+            state.pending[1] += dy * precision;
         }
     }
 }
@@ -435,10 +443,17 @@ pub fn run(output: &str, gain: f64, sender: &Sender<Request>) -> Result<bool> {
                 || scale != 0.0
                 || last_send.elapsed() >= Duration::from_millis(500)
             {
-                let _ = sender.send_blocking(Request::DragMotion {
-                    translation: [x * gain, y * gain, z].map(|v| v.clamp(-0.5, 0.5) as f32),
-                    scale_steps: scale.clamp(-6.0, 6.0) as f32,
-                });
+                let request = if state.button_down == Some(RESIZE_BUTTON) {
+                    Request::DragResize {
+                        delta: [x as f32, y as f32],
+                    }
+                } else {
+                    Request::DragMotion {
+                        translation: [x * gain, -y * gain, z].map(|v| v.clamp(-0.5, 0.5) as f32),
+                        scale_steps: scale.clamp(-6.0, 6.0) as f32,
+                    }
+                };
+                let _ = sender.send_blocking(request);
                 last_send = Instant::now();
             }
         }
@@ -490,14 +505,14 @@ mod tests {
         queue.roundtrip(&mut state).unwrap();
         let output = std::env::var("FRAME_TEST_NESTED_DRAG").unwrap();
 
-        let buttons = |down| {
+        let buttons = |button, down| {
             use wl_pointer::ButtonState;
             let state = if down {
                 ButtonState::Pressed
             } else {
                 ButtonState::Released
             };
-            pointer.button(1, 272, state);
+            pointer.button(1, button, state);
             pointer.frame();
             conn.flush().unwrap();
         };
@@ -506,7 +521,10 @@ mod tests {
         conn.flush().unwrap();
         thread::sleep(Duration::from_millis(100));
 
-        for cancel in [false, true] {
+        for (button, cancel) in [MOVE_BUTTON, RESIZE_BUTTON]
+            .into_iter()
+            .flat_map(|button| [(button, false), (button, true)])
+        {
             let (tx, rx) = smol::channel::unbounded();
             let output = output.clone();
             let capture = thread::spawn(move || run(&output, 0.0015, &tx));
@@ -519,7 +537,7 @@ mod tests {
                     panic!("capture did not arm");
                 },
             ));
-            buttons(true);
+            buttons(button, true);
             thread::sleep(Duration::from_millis(100));
             // Move farther than the distance from the center of the nested
             // output to its edge while the cursor is locked in place.
@@ -540,7 +558,7 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(80));
             }
-            buttons(false);
+            buttons(button, false);
             assert_eq!(capture.join().unwrap().unwrap(), !cancel);
             let [dx, dy] =
                 std::iter::from_fn(|| rx.try_recv().ok()).fold([0.0, 0.0], |[x, y], request| {
@@ -549,16 +567,24 @@ mod tests {
                             translation: [dx, dy, _],
                             ..
                         } => [x + dx, y + dy],
-                        _ => [x, y],
+                        Request::DragResize { delta: [dx, dy] } if button == RESIZE_BUTTON => {
+                            [x + dx, y + dy]
+                        }
+                        _ => panic!("unexpected drag message: {request:?}"),
                     }
                 });
-            assert!(dx > 3.0 && dy > 0.0, "long drag delivered [{dx}, {dy}]");
+            if button == MOVE_BUTTON {
+                assert!(dx > 3.0 && dy > 0.0, "long drag delivered [{dx}, {dy}]");
+            } else {
+                // Arming sends an empty move heartbeat before a button is held.
+                assert!(dx > 2000.0 && dy < -80.0, "resize delivered [{dx}, {dy}]");
+            }
         }
 
         // A normal click after teardown must go to the underlying application.
         thread::sleep(Duration::from_millis(100));
-        buttons(true);
-        buttons(false);
+        buttons(MOVE_BUTTON, true);
+        buttons(MOVE_BUTTON, false);
         thread::sleep(Duration::from_millis(150));
     }
 }
