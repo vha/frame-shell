@@ -67,6 +67,7 @@ enum PanelOwnership {
         panel_workspace_id: i32,
         return_workspace_id: i32,
         return_monitor: String,
+        restore_tiled: bool,
     },
     Workspace {
         workspace_id: i32,
@@ -468,6 +469,7 @@ impl Worker {
                             panel_workspace_id: -1,
                             return_workspace_id: return_ws,
                             return_monitor,
+                            restore_tiled: detach.as_ref().is_some_and(|drop| drop.restore_tiled),
                         },
                     )
                 }
@@ -565,10 +567,15 @@ impl Worker {
                         app_id,
                         return_workspace_id,
                         return_monitor,
+                        restore_tiled,
                         ..
                     } => {
                         backend.move_window_to_workspace(&address, &default_ws_id.to_string())?;
                         if let Some(drop) = &detach {
+                            if restore_tiled {
+                                backend.set_window_floating(&address, true)?;
+                                backend.resize_floating_window(&address, drop.window.size)?;
+                            }
                             let pos = sizing::recenter(
                                 backend.as_ref(),
                                 vmon,
@@ -594,6 +601,7 @@ impl Worker {
                             panel_workspace_id: default_ws_id,
                             return_workspace_id,
                             return_monitor,
+                            restore_tiled,
                         })
                     }
                     PanelOwnership::Workspace {
@@ -615,11 +623,7 @@ impl Worker {
                 Ok(own) => own,
                 Err(err) => {
                     if let Some(drop) = &detach {
-                        let _ = backend.move_window_to_workspace(
-                            &drop.window.address,
-                            &drop.original_workspace.to_string(),
-                        );
-                        let _ = backend.move_floating_window(&drop.window.address, drop.original_position);
+                        drop.restore_window(backend.as_ref());
                     }
                     let _ = backend.remove_output(&output_name);
                     if detach.is_some() {
@@ -662,11 +666,7 @@ impl Worker {
                 Err(error) => {
                     self.shared.unregister_stream(surface);
                     if let Some(drop) = &detach {
-                        let _ = backend.move_window_to_workspace(
-                            &drop.window.address,
-                            &drop.original_workspace.to_string(),
-                        );
-                        let _ = backend.move_floating_window(&drop.window.address, drop.original_position);
+                        drop.restore_window(backend.as_ref());
                         let _ = backend.remove_output(&output_name);
                         let _ = backend.configure_outputs(&pin_updates);
                     }
@@ -718,7 +718,10 @@ impl Worker {
                             });
                     if let Err(error) = self.wait_for_frame(surface, size, serial) {
                         self.close_panel(surface, true, true);
-                        let _ = backend.move_floating_window(&drop.window.address, drop.original_position);
+                        if !drop.restore_tiled {
+                            let _ = backend
+                                .move_floating_window(&drop.window.address, drop.original_position);
+                        }
                         self.output.send(&HostMessage::Error(format!(
                             "Could not stream the detached window: {error:#}"
                         )));
@@ -799,6 +802,7 @@ impl Worker {
                 panel_workspace_id,
                 return_workspace_id,
                 return_monitor,
+                restore_tiled,
                 ..
             } => {
                 let target_ws = if restore_owned {
@@ -815,7 +819,13 @@ impl Worker {
                 };
                 for win in &windows {
                     if win.address == *address && restore_owned {
-                        let _ = backend.move_window_to_workspace(&win.address, &target_ws.to_string());
+                        if backend
+                            .move_window_to_workspace(&win.address, &target_ws.to_string())
+                            .is_ok()
+                            && *restore_tiled
+                        {
+                            let _ = backend.set_window_floating(&win.address, false);
+                        }
                     } else if win.monitor_name == panel.output_name || win.workspace_id == *panel_workspace_id
                     {
                         let _ = backend
@@ -1503,26 +1513,18 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(25));
             };
             let address = &original.address;
-            for command in [
-                format!("hl.dsp.window.float({{ window = 'address:{address}', action = 'set' }})"),
-                format!(
-                    "hl.dsp.window.resize({{ window = 'address:{address}', x = 800, y = 520, relative = false }})"
-                ),
-            ] {
-                let reply = std::process::Command::new("hyprctl")
-                    .args(["dispatch", &command])
-                    .output()
-                    .unwrap();
-                assert_eq!(String::from_utf8_lossy(&reply.stdout).trim(), "ok");
-            }
+            assert!(!original.floating);
             let (x, y) = anchor.logical_pos;
             let start = [x + 160, y + 100];
             let edge = [x + 1, y + 100];
             for id in [1, 2, 3] {
+                backend.set_window_floating(address, true).unwrap();
+                backend.resize_floating_window(address, [800, 520]).unwrap();
                 backend
                     .move_floating_window(address, [x + 100, y + 40])
                     .unwrap();
                 backend.move_cursor(start).unwrap();
+                let before_drag = backend.list_windows().unwrap();
                 manager_ref.send(Command::Detach(DetachGesture::Begin {
                     id,
                     address: address.clone(),
@@ -1543,7 +1545,12 @@ mod tests {
                     if let Some(Some(preview)) = latest {
                         break preview;
                     }
-                    assert!(Instant::now() < deadline, "detach preview never armed");
+                    assert!(
+                        Instant::now() < deadline,
+                        "detach preview never armed in gesture {id}: {before_drag:?} -> {:?}, pointer {:?}",
+                        backend.list_windows(),
+                        backend.cursor_position(),
+                    );
                     drop(events);
                     std::thread::sleep(Duration::from_millis(25));
                 };
@@ -1574,13 +1581,12 @@ mod tests {
                     assert_eq!(backend.list_monitors().unwrap().len(), 1);
                     continue;
                 }
+                // Hyprland retiles a tiled window before dispatching the release.
+                backend.set_window_floating(address, false).unwrap();
                 shared.virtual_resize_ack.store(id == 3, Ordering::Release);
                 let release = if id == 2 {
-                    // The native drag can end before the release reaches the host.
-                    // Simulate a compositor snap and a small pointer retreat.
-                    backend
-                        .move_floating_window(address, [x + 100, y + 40])
-                        .unwrap();
+                    // Retiling changed the position and size. Keep the drop armed
+                    // through that change and a small pointer retreat.
                     let near_edge = [x + 30, edge[1]];
                     backend.move_cursor(near_edge).unwrap();
                     std::thread::sleep(Duration::from_millis(125));
@@ -1609,6 +1615,7 @@ mod tests {
                         .unwrap();
                     assert_eq!(returned.workspace_id, original.workspace_id);
                     assert_eq!(returned.monitor_name, original.monitor_name);
+                    assert!(!returned.floating);
                     continue;
                 }
                 let deadline = Instant::now() + Duration::from_secs(6);
@@ -1648,12 +1655,24 @@ mod tests {
                     .unwrap();
                 assert_eq!([detached.width, detached.height], preview.size);
                 assert_eq!(detached.logical_pos.0 + detached.logical_size.0, x);
+                assert!(backend.list_windows().unwrap().iter().any(|window| {
+                    &window.address == address
+                        && window.floating
+                        && window.monitor_name == detached.name
+                }));
                 manager_ref.send(Command::Close { surface });
                 let deadline = Instant::now() + Duration::from_secs(3);
-                while !lock(events_ref).removed.contains(&surface) {
+                while !lock(events_ref).removed.contains(&surface)
+                    || backend.list_monitors().unwrap().len() != 1
+                {
                     assert!(Instant::now() < deadline, "detached output did not close");
                     std::thread::sleep(Duration::from_millis(25));
                 }
+                assert!(backend.list_windows().unwrap().iter().any(|window| {
+                    &window.address == address
+                        && !window.floating
+                        && window.workspace_id == original.workspace_id
+                }));
             }
             let _ = terminal.kill();
             let _ = terminal.wait();

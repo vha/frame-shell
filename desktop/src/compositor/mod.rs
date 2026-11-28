@@ -98,6 +98,8 @@ pub trait CompositorBackend: Send + Sync {
     fn cursor_position(&self) -> Result<[i32; 2]>;
     fn move_cursor(&self, position: [i32; 2]) -> Result<()>;
     fn move_floating_window(&self, address: &str, position: [i32; 2]) -> Result<()>;
+    fn set_window_floating(&self, address: &str, floating: bool) -> Result<()>;
+    fn resize_floating_window(&self, address: &str, size: [u32; 2]) -> Result<()>;
     fn window_border(&self) -> Result<u32>;
     fn move_window_to_workspace(&self, address: &str, workspace_target: &str) -> Result<()>;
     fn move_workspace_to_output(&self, workspace_id: i32, output: &str) -> Result<()>;

@@ -114,7 +114,7 @@ Drag a single floating app in **Fit to window** mode with your usual window gest
 Frame Shell follows when the window and pointer settle. **Auto-sync VR layout to desktop** snaps the virtual
 output to a valid desktop position. Resizing the app on one axis keeps the other VR dimension the same.
 
-To detach a floating app from its desktop, load the helper after your existing Hyprland move binding. Pass the
+To detach an app from its desktop, load the helper after your existing Hyprland move binding. Pass the
 same chord and the path to the Frame Shell build of `wayvrctl`.
 
 ```lua
@@ -123,7 +123,8 @@ dofile("/path/to/frame-shell/scripts/hyprland-detach.lua")("SUPER + mouse:272", 
 
 Drag toward an edge that opens onto empty space. Pause near the edge until **Drop to create panel** and the
 VR outline appear, then release the mouse button to detach. Pull back to cancel or cross an edge that connects
-to another output to move the app there normally. The new panel fits to the window at creation.
+to another output to move the app there normally. The new panel fits to the window at creation. A previously
+tiled window floats on its own panel and returns to tiling when the panel closes.
 
 Store optional PC picker defaults in `${XDG_CONFIG_HOME:-~/.config}/frame-shell/virtual-panels.json`.
 

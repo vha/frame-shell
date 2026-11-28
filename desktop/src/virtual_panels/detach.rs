@@ -22,6 +22,7 @@ pub(super) struct Gesture {
     deadline: Instant,
     candidate: Option<(DropEdge, Instant)>,
     preview: Option<DetachPlacement>,
+    dragged_window: Option<WindowInfo>,
 }
 
 pub(super) struct Creation {
@@ -31,8 +32,21 @@ pub(super) struct Creation {
     pub original_workspace: i32,
     pub original_monitor: String,
     pub original_position: [i32; 2],
+    pub restore_tiled: bool,
     pub cursor: [i32; 2],
     pub border: u32,
+}
+
+impl Creation {
+    pub fn restore_window(&self, backend: &dyn crate::compositor::CompositorBackend) {
+        let address = &self.window.address;
+        let _ = backend.move_window_to_workspace(address, &self.original_workspace.to_string());
+        if self.restore_tiled {
+            let _ = backend.set_window_floating(address, false);
+        } else {
+            let _ = backend.move_floating_window(address, self.original_position);
+        }
+    }
 }
 
 impl Worker {
@@ -61,7 +75,7 @@ impl Worker {
                 let Some(window) = backend.list_windows().ok().and_then(|windows| {
                     windows
                         .into_iter()
-                        .find(|w| w.address == address && w.floating && !w.fullscreen && !w.pinned)
+                        .find(|w| w.address == address && !w.fullscreen && !w.pinned)
                 }) else {
                     return;
                 };
@@ -79,6 +93,7 @@ impl Worker {
                     deadline: Instant::now() + TIMEOUT,
                     candidate: None,
                     preview: None,
+                    dragged_window: None,
                 });
             }
             DetachGesture::Release { id, cursor } => {
@@ -143,6 +158,9 @@ impl Worker {
             .and_then(|backend| backend.cursor_position().ok())
             .and_then(|cursor| self.detach_candidate(&gesture, cursor));
         let edge = candidate.as_ref().map(|creation| creation.placement.edge);
+        if let Some(creation) = candidate.as_ref().filter(|creation| !creation.restore_tiled) {
+            gesture.dragged_window = Some(creation.window.clone());
+        }
         if edge != gesture.candidate.map(|(edge, _)| edge) {
             gesture.candidate = edge.map(|edge| (edge, now));
         }
@@ -178,9 +196,8 @@ impl Worker {
         }
         let armed = gesture.preview.as_ref().map(|preview| preview.edge);
         let edge = drop_edge(&monitors, anchor, gesture.start, cursor, armed)?;
-        let window = backend.list_windows().ok()?.into_iter().find(|window| {
+        let current = backend.list_windows().ok()?.into_iter().find(|window| {
             window.address == gesture.window.address
-                && window.floating
                 && !window.fullscreen
                 && !window.pinned
                 // Hyprland can snap the window back or assign its center to another
@@ -189,12 +206,20 @@ impl Worker {
                     window.workspace_id == gesture.window.workspace_id
                         || window.monitor_name != anchor.name
                 } else {
-                    window.workspace_id == gesture.window.workspace_id
+                    window.floating
+                        && window.workspace_id == gesture.window.workspace_id
                         && window.monitor_name == anchor.name
                         && window.pos != gesture.window.pos
-                        && window.size == gesture.window.size
                 }
         })?;
+        // A native drag temporarily floats tiled windows. Hyprland tiles them
+        // again before sending our release callback, so keep their drag geometry.
+        let restore_tiled = !current.floating;
+        let window = if restore_tiled {
+            gesture.dragged_window.clone()?
+        } else {
+            current
+        };
         let border = backend.window_border().ok()?;
         // The new output has no reserved space and runs at scale 1.
         let mut new_monitor = anchor.clone();
@@ -212,6 +237,7 @@ impl Worker {
             original_workspace: gesture.window.workspace_id,
             original_monitor: gesture.window.monitor_name.clone(),
             original_position: gesture.window.pos,
+            restore_tiled,
             cursor,
             border,
         })
