@@ -121,12 +121,54 @@ pub fn poll_desktop_visibility<T: Default>(
 
 static COMMITTED_PLACEMENTS: Mutex<BTreeMap<u32, BTreeMap<u32, CommittedPlacement>>> =
     Mutex::new(BTreeMap::new());
+static DETACHMENTS: Mutex<BTreeMap<(u32, u32), Detachment>> = Mutex::new(BTreeMap::new());
+
+struct Detachment {
+    placement: wayvr_ipc::virtual_panel::DetachPlacement,
+    parent_overlay: Option<Arc<str>>,
+    center: glam::Vec3A,
+}
 
 pub fn clear_virtual_layout(source: u32) {
     COMMITTED_PLACEMENTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&source);
+    DETACHMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(pc, _), _| *pc != source);
+}
+
+fn detach_parent_name(source: u32, anchor: &str) -> Option<Arc<str>> {
+    let state = crate::frame_host::virtual_state(source);
+    state
+        .as_ref()
+        .and_then(|state| {
+            state
+                .panels
+                .iter()
+                .find(|panel| panel.output_name == anchor)
+                .map(|panel| virtual_overlay_name(source, panel.surface, &panel.output_name))
+        })
+        .or_else(|| {
+            crate::frame_hosts::for_source(source)
+                .map(|pc| Arc::<str>::from(format!("{} {anchor}", pc.id)))
+        })
+}
+
+pub fn remember_detach<T>(
+    overlays: &crate::windowing::manager::OverlayWindowManager<T>,
+    source: u32,
+    surface: u32,
+    placement: wayvr_ipc::virtual_panel::DetachPlacement,
+    center: glam::Vec3A,
+) {
+    let parent = detach_parent_name(source, &placement.anchor)
+        .and_then(|name| overlays.overlay_transform(&name).map(|pose| (name, pose)));
+    let (parent_overlay, center) = parent.map_or((None, center), |(name, pose)| {
+        (Some(name), pose.inverse().transform_point3a(center))
+    });
+    DETACHMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((source, surface), Detachment { placement, parent_overlay, center });
 }
 
 pub fn detach_pose<T>(
@@ -135,20 +177,7 @@ pub fn detach_pose<T>(
     source: u32,
     placement: &wayvr_ipc::virtual_panel::DetachPlacement,
 ) -> (glam::Affine3A, glam::Vec2) {
-    let state = crate::frame_host::virtual_state(source);
-    let parent_name = state
-        .as_ref()
-        .and_then(|state| {
-            state
-                .panels
-                .iter()
-                .find(|panel| panel.output_name == placement.anchor)
-                .map(|panel| virtual_overlay_name(source, panel.surface, &panel.output_name))
-        })
-        .or_else(|| {
-            crate::frame_hosts::for_source(source)
-                .map(|pc| Arc::<str>::from(format!("{} {}", pc.id, placement.anchor)))
-        });
+    let parent_name = detach_parent_name(source, &placement.anchor);
     let anchor = parent_name.and_then(|name| {
         overlays.iter().find_map(|(_, overlay)| {
             (overlay.config.name == name)
@@ -310,18 +339,61 @@ pub fn poll_virtual_layout<T: Default>(
             })
             .collect();
         let mut virtuals = Vec::with_capacity(vstate.panels.len());
+        let live_surfaces: BTreeSet<u32> = surfaces()
+            .keys()
+            .filter(|&&key| (key >> 32) as u32 == source)
+            .map(|&key| key as u32)
+            .collect();
+        let mut detachments = DETACHMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        detachments.retain(|(pc, surface), _| {
+            *pc != source
+                || vstate.panels.iter().any(|panel| panel.surface == *surface)
+                || live_surfaces.contains(surface)
+        });
         for panel in &vstate.panels {
             let name = virtual_overlay_name(source, panel.surface, &panel.output_name);
             let Some(transform) = overlays.overlay_transform(&name) else {
                 waiting_for_spawn = true;
                 continue;
             };
+            let key = (source, panel.surface);
+            let attachment = detachments.get(&key).and_then(|detach| {
+                use wayvr_ipc::virtual_panel::DropEdge;
+                use super::layout_solver::{Attachment, EdgeSide};
+
+                let mut center = transform.translation;
+                if let Some(name) = &detach.parent_overlay {
+                    center = overlays.overlay_transform(name)?.inverse().transform_point3a(center);
+                }
+                if center.distance_squared(detach.center) > 0.01_f32.powi(2) {
+                    return None;
+                }
+                let anchor = &detach.placement.anchor;
+                let parent_key = vstate.panels.iter().find(|p| &p.output_name == anchor)
+                    .map(|p| format!("v:{}", p.surface))
+                    .or_else(|| physical.iter().any(|p| &p.key == anchor).then(|| anchor.clone()))?;
+                Some(Attachment {
+                    parent_key,
+                    edge: match detach.placement.edge {
+                        DropEdge::Top => EdgeSide::Top,
+                        DropEdge::Bottom => EdgeSide::Bottom,
+                        DropEdge::Left => EdgeSide::Left,
+                        DropEdge::Right => EdgeSide::Right,
+                    },
+                    offset: detach.placement.offset,
+                })
+            });
+            if attachment.is_none() {
+                detachments.remove(&key);
+            }
             virtuals.push(VirtualPanelPose {
                 surface: panel.surface,
                 logical_size: panel.logical_size,
                 overlay_transform: transform,
+                attachment,
             });
         }
+        drop(detachments);
         // A panel without an overlay pose still occupies space in Hyprland.
         if virtuals.len() != vstate.panels.len() {
             continue;
@@ -535,7 +607,7 @@ pub fn poll_surfaces(app: &mut AppState) {
         let name = surface.name.clone();
         let source = (key >> 32) as u32;
         let spawn = crate::frame_host::take_detach_placement(source, key as u32)
-            .map_or(SpawnPos::Spread, |placement| SpawnPos::Detached(source, placement));
+            .map_or(SpawnPos::Spread, |placement| SpawnPos::Detached(source, key as u32, placement));
         app.tasks.enqueue(TaskType::Overlay(OverlayTask::Spawn(
             OverlaySelector::Name(name.clone()),
             spawn,

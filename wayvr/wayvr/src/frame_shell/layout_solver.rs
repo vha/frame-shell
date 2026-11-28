@@ -19,6 +19,14 @@ pub struct VirtualPanelPose {
     pub surface: u32,
     pub logical_size: [i32; 2],
     pub overlay_transform: Affine3A,
+    pub attachment: Option<Attachment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub parent_key: String,
+    pub edge: EdgeSide,
+    pub offset: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -163,11 +171,12 @@ fn is_valid_layout(rects: &[PlacedRect], phys_count: usize) -> bool {
 fn rigid_cluster(
     rects: &[PlacedRect],
     phys_count: usize,
+    pinned: &BTreeSet<usize>,
     start: usize,
     axis: Axis,
 ) -> BTreeSet<usize> {
     let mut cluster = BTreeSet::new();
-    if start < phys_count {
+    if start < phys_count || pinned.contains(&start) {
         return cluster;
     }
     let mut stack = vec![start];
@@ -175,7 +184,7 @@ fn rigid_cluster(
     while let Some(cur) = stack.pop() {
         let a = &rects[cur];
         for nxt in phys_count..rects.len() {
-            if cluster.contains(&nxt) {
+            if cluster.contains(&nxt) || pinned.contains(&nxt) {
                 continue;
             }
             let b = &rects[nxt];
@@ -192,8 +201,15 @@ fn rigid_cluster(
 }
 
 /// Deterministically closes small dead corridors between edge-facing rectangles along `axis`
-/// while keeping physical monitors fixed and preserving overlap/connectivity invariants.
-fn compact_axis(rects: &mut Vec<PlacedRect>, phys_count: usize, axis: Axis) {
+/// while keeping physical monitors and explicitly detached panels fixed and preserving
+/// overlap, connectivity, and committed parent-edge invariants.
+fn compact_axis(
+    rects: &mut Vec<PlacedRect>,
+    phys_count: usize,
+    axis: Axis,
+    pinned: &BTreeSet<usize>,
+    committed_edges: &[(usize, usize, EdgeSide)],
+) {
     let max_steps = rects.len() * rects.len() + 4;
     let mut tried: BTreeSet<(usize, usize)> = BTreeSet::new();
 
@@ -201,7 +217,9 @@ fn compact_axis(rects: &mut Vec<PlacedRect>, phys_count: usize, axis: Axis) {
         let mut best_pair: Option<(i32, usize, usize)> = None;
         for i in 0..rects.len() {
             for j in 0..rects.len() {
-                if i == j || (i < phys_count && j < phys_count) || tried.contains(&(i, j)) {
+                let i_fixed = i < phys_count || pinned.contains(&i);
+                let j_fixed = j < phys_count || pinned.contains(&j);
+                if i == j || (i_fixed && j_fixed) || tried.contains(&(i, j)) {
                     continue;
                 }
                 let gap = rects[j].primary_start(axis) - rects[i].primary_end(axis);
@@ -252,8 +270,8 @@ fn compact_axis(rects: &mut Vec<PlacedRect>, phys_count: usize, axis: Axis) {
         };
         tried.insert((i, j));
 
-        let left_cluster = rigid_cluster(rects, phys_count, i, axis);
-        let right_cluster = rigid_cluster(rects, phys_count, j, axis);
+        let left_cluster = rigid_cluster(rects, phys_count, pinned, i, axis);
+        let right_cluster = rigid_cluster(rects, phys_count, pinned, j, axis);
         if left_cluster.is_empty() && right_cluster.is_empty() {
             continue;
         }
@@ -334,7 +352,18 @@ fn compact_axis(rects: &mut Vec<PlacedRect>, phys_count: usize, axis: Axis) {
             for &v in &right_cluster {
                 trial[v].shift(axis, -step_r);
             }
-            if is_valid_layout(&trial, phys_count) {
+            if is_valid_layout(&trial, phys_count)
+                && committed_edges.iter().all(|&(child, parent, edge)| {
+                    let (child, parent) = (&trial[child], &trial[parent]);
+                    let on_edge = match edge {
+                        EdgeSide::Top => child.y + child.h == parent.y,
+                        EdgeSide::Bottom => child.y == parent.y + parent.h,
+                        EdgeSide::Left => child.x + child.w == parent.x,
+                        EdgeSide::Right => child.x == parent.x + parent.w,
+                    };
+                    on_edge && child.shared_edge_len(parent) >= min_edge_overlap(child, parent)
+                })
+            {
                 *rects = trial;
                 tried.clear();
                 break;
@@ -482,8 +511,19 @@ pub fn solve_layout(
 
     let mut virtual_indices: Vec<(u32, usize)> = Vec::with_capacity(ordered.len());
     let mut committed = BTreeMap::new();
+    let mut pinned = BTreeSet::new();
+    let mut committed_edges = Vec::new();
 
-    for panel in ordered {
+    while !ordered.is_empty() {
+        // Reserve a detached panel's edge as soon as its parent is placed.
+        let next = ordered.iter().position(|panel| {
+            panel.attachment.as_ref().is_some_and(|a| placed.iter().any(|p| p.key == a.parent_key))
+        }).or_else(|| ordered.iter().position(|panel| {
+            panel.attachment.as_ref().is_none_or(|a| {
+                !ordered.iter().any(|p| format!("v:{}", p.surface) == a.parent_key)
+            })
+        })).unwrap_or(0);
+        let panel = ordered.remove(next);
         let vw = panel.logical_size[0].max(1);
         let vh = panel.logical_size[1].max(1);
 
@@ -494,7 +534,7 @@ pub fn solve_layout(
         let target_cx = primary_cx + dx_m * px_per_m;
         let target_cy = primary_cy - dy_m * px_per_m;
 
-        let mut best: Option<(f32, usize, EdgeSide, i32, i32, String)> = None;
+        let mut best: Option<(bool, f32, usize, EdgeSide, i32, i32)> = None;
         for (parent_idx, parent) in placed.iter().enumerate() {
             let min_ox = 48.min(vw).min(parent.w).max(1);
             let min_oy = 48.min(vh).min(parent.h).max(1);
@@ -525,7 +565,20 @@ pub fn solve_layout(
                 (EdgeSide::Right, parent.x + parent.w, y_snapped),
             ];
 
-            for (edge, x, y) in candidates {
+            for (edge, mut x, mut y) in candidates {
+                let attachment = panel.attachment.as_ref().filter(|a| a.parent_key == parent.key && a.edge == edge);
+                if let Some(a) = attachment {
+                    match edge {
+                        EdgeSide::Top | EdgeSide::Bottom => {
+                            x = (parent.x + (parent.w - vw) / 2 + a.offset)
+                                .clamp(parent.x - vw + min_ox, parent.x + parent.w - min_ox);
+                        }
+                        EdgeSide::Left | EdgeSide::Right => {
+                            y = (parent.y + (parent.h - vh) / 2 + a.offset)
+                                .clamp(parent.y - vh + min_oy, parent.y + parent.h - min_oy);
+                        }
+                    }
+                }
                 if placed.iter().any(|r| r.intersects_strict(x, y, vw, vh)) {
                     continue;
                 }
@@ -537,36 +590,42 @@ pub fn solve_layout(
                 });
                 let score = if sticky { dist - 64.0 } else { dist };
                 let better = best.as_ref().is_none_or(|b| {
-                    score
-                        .total_cmp(&b.0)
-                        .then_with(|| parent_idx.cmp(&b.1))
-                        .then_with(|| edge.cmp(&b.2))
-                        .then_with(|| x.cmp(&b.3))
-                        .then_with(|| y.cmp(&b.4))
+                    attachment.is_none().cmp(&b.0)
+                        .then_with(|| score.total_cmp(&b.1))
+                        .then_with(|| parent_idx.cmp(&b.2))
+                        .then_with(|| edge.cmp(&b.3))
+                        .then_with(|| x.cmp(&b.4))
+                        .then_with(|| y.cmp(&b.5))
                         .is_lt()
                 });
                 if better {
-                    best = Some((score, parent_idx, edge, x, y, parent.key.clone()));
+                    best = Some((attachment.is_none(), score, parent_idx, edge, x, y));
                 }
             }
         }
 
         let (x, y, commit) = match best {
-            Some((_, _, edge, x, y, parent_key)) => {
-                (x, y, CommittedPlacement { parent_key, edge })
+            Some((ordinary, _, parent, edge, x, y)) => {
+                if !ordinary {
+                    pinned.insert(placed.len());
+                }
+                committed_edges.push((placed.len(), parent, edge));
+                (x, y, CommittedPlacement { parent_key: placed[parent].key.clone(), edge })
             }
             None => {
                 // Guaranteed non-overlapping rightmost fallback attached to a rightmost placed rect.
                 let max_x = placed.iter().map(|r| r.x + r.w).max().unwrap_or(0);
-                let anchor = placed
+                let (parent_idx, anchor) = placed
                     .iter()
-                    .filter(|r| r.x + r.w == max_x)
-                    .min_by(|a, b| {
+                    .enumerate()
+                    .filter(|(_, r)| r.x + r.w == max_x)
+                    .min_by(|(_, a), (_, b)| {
                         let da = (a.center().1 - target_cy).abs();
                         let db = (b.center().1 - target_cy).abs();
                         da.total_cmp(&db).then_with(|| a.y.cmp(&b.y))
                     })
-                    .unwrap_or(&placed[0]);
+                    .unwrap_or((0, &placed[0]));
+                committed_edges.push((placed.len(), parent_idx, EdgeSide::Right));
                 (
                     max_x,
                     anchor.y,
@@ -590,8 +649,8 @@ pub fn solve_layout(
         virtual_indices.push((panel.surface, placed_idx));
     }
 
-    compact_axis(&mut placed, phys_count, Axis::Horizontal);
-    compact_axis(&mut placed, phys_count, Axis::Vertical);
+    compact_axis(&mut placed, phys_count, Axis::Horizontal, &pinned, &committed_edges);
+    compact_axis(&mut placed, phys_count, Axis::Vertical, &pinned, &committed_edges);
 
     let mut targets: Vec<PanelLayoutTarget> = virtual_indices
         .into_iter()
@@ -628,6 +687,7 @@ mod tests {
             surface,
             logical_size: [w, h],
             overlay_transform: transform,
+            attachment: None,
         }
     }
 
@@ -890,5 +950,60 @@ mod tests {
         let sol1 = solve_layout(&physical, &virtuals, None, &BTreeMap::new());
         let sol2 = solve_layout(&physical, &virtuals, None, &sol1.committed);
         assert_eq!(sol1.targets, sol2.targets);
+    }
+
+    #[test]
+    fn detached_panel_above_side_monitor_stays_above_side_monitor() {
+        let physical = vec![
+            phys("HDMI-A-2", -1920, 0, 1920, 1080, Some(pose(-1.3, 0.0, -1.3, 1.2))),
+            phys("DP-4", 0, 0, 2560, 1080, Some(pose(0.0, 0.0, -1.5, 1.5))),
+        ];
+        // FRAME-V1 sits to the right of DP-4 and extends above y=0, while FRAME-V5 was detached
+        // upwards from HDMI-A-2 (even if its 3D projection relative to DP-4 leans right).
+        let virtuals = vec![
+            virt(0x8000_0000, 1616, 2056, pose(1.6, 0.0, -1.3, 1.4)),
+            VirtualPanelPose {
+                surface: 0x8000_0004,
+                logical_size: [960, 1034],
+                overlay_transform: pose(0.6, 0.7, -1.4, 0.9),
+                attachment: Some(Attachment {
+                    parent_key: "HDMI-A-2".into(),
+                    edge: EdgeSide::Top,
+                    offset: 480,
+                }),
+            },
+        ];
+        let sol = solve_layout(&physical, &virtuals, None, &BTreeMap::new());
+        assert_invariants(&physical, &virtuals, &sol);
+        let v5 = sol.targets.iter().find(|t| t.surface == 0x8000_0004).unwrap();
+        assert_eq!(v5.y, -1034);
+        assert_eq!(v5.x, -960, "FRAME-V5 must remain above HDMI-A-2, not slide over DP-4");
+        assert_eq!(sol.committed[&0x8000_0004].parent_key, "HDMI-A-2");
+        assert_eq!(sol.committed[&0x8000_0004].edge, EdgeSide::Top);
+    }
+
+    #[test]
+    fn side_monitor_virtual_is_not_pulled_across_main_monitor_by_compaction() {
+        let physical = vec![
+            phys("HDMI-A-2", -1920, 0, 1920, 1080, None),
+            phys("DP-4", 0, 0, 2560, 1080, Some(pose(0.0, 0.0, -1.5, 1.5))),
+        ];
+        // Even without a detach attachment, a virtual panel placed above the right half of
+        // HDMI-A-2 must not be pulled across DP-4 to touch FRAME-V1 on DP-4's right edge.
+        let virtuals = vec![
+            virt(0x8000_0000, 1616, 2056, pose(1.6, 0.0, -1.3, 1.4)),
+            virt(0x8000_0004, 960, 1034, pose(-1.05, 0.85, -1.5, 0.9)),
+        ];
+        let sol = solve_layout(&physical, &virtuals, None, &BTreeMap::new());
+        assert_invariants(&physical, &virtuals, &sol);
+        let v5 = sol.targets.iter().find(|t| t.surface == 0x8000_0004).unwrap();
+        assert_eq!(v5.y, -1034);
+        assert!(
+            v5.x < 0,
+            "FRAME-V5 should stay over HDMI-A-2 (x < 0), got ({}, {})",
+            v5.x,
+            v5.y
+        );
+        assert_eq!(sol.committed[&0x8000_0004].parent_key, "HDMI-A-2");
     }
 }
