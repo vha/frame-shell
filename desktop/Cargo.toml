@@ -16,6 +16,8 @@ frame-abi = { path = "../wayvr/frame-abi" }
 glib = "0.21"
 gstreamer = "0.24"
 gstreamer-app = "0.24"
+gstreamer-allocators = "0.24"
+gstreamer-video = "0.24"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -255,6 +255,7 @@ pub enum PacketClient {
 	WlxOverlaySetVisible(String, bool),
 	/// What runs on the headset and on each PC, as the keyboard's top row lists it
 	WlxAppList(Serial),
+	VirtualPanel(Serial, crate::virtual_panel::Request),
 	/// Receive `CustomEvent`s with these names, or all of them for an empty list
 	CustomEventSubscribe(Vec<String>),
 }

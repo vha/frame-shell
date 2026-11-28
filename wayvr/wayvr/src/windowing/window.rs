@@ -239,7 +239,7 @@ impl OverlayWindowConfig {
         let Some(state) = self.active_state.as_ref() else {
             return false;
         };
-        let transform = state.transform;
+        let transform = self.surface_transform(state.transform);
         let curvature = state.curvature;
 
         let Some((_dist, local_pos)) = raycast_overlay(ray, &transform, curvature) else {
@@ -251,6 +251,10 @@ impl OverlayWindowConfig {
 
         let uv = interaction_transform.transform_point2(local_pos);
         (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)
+    }
+
+    pub(crate) fn surface_transform(&self, pose: Affine3A) -> Affine3A {
+        pose * Affine3A::from_scale(glam::Vec3::splat(self.backend.surface_scale()))
     }
 
     fn auto_movement(&mut self, app: &mut AppState) {
@@ -422,7 +426,9 @@ pub fn realign(transform: &mut Affine3A, hmd: &Affine3A, scale: f32, snap_angle:
         rotation = Mat3A::from_euler(EulerRot::YXZ, yaw, pitch, roll);
     }
 
-    transform.matrix3 = rotation.mul_scalar(scale);
+    if rotation.is_finite() {
+        transform.matrix3 = rotation.mul_scalar(scale);
+    }
 }
 
 pub fn scalar_scale(a: &Affine3A) -> f32 {
@@ -433,7 +439,7 @@ pub fn scalar_scale(a: &Affine3A) -> f32 {
         / 3.0
 }
 
-pub fn save_transform(state: &mut OverlayWindowState, app: &mut AppState) {
+pub fn save_transform(state: &mut OverlayWindowState, app: &AppState) {
     let parent_transform = match state.positioning {
         Positioning::Floating => snap_upright(app.input_state.hmd, Vec3A::Y),
         Positioning::FollowHead { .. } => app.input_state.hmd,

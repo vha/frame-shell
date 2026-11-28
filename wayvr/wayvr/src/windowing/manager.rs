@@ -591,13 +591,13 @@ impl<T> OverlayWindowManager<T> {
                 .iter()
                 .filter_map(|(k, v)| {
                     let n = self.overlays.get(k).map(|o| o.config.name.clone())?;
-                    Some((n, v.clone()))
+                    (!crate::frame_shell::is_virtual_overlay_name(&n)).then_some((n, v.clone()))
                 })
                 .collect();
 
             // overlays that we haven't seen since startup (e.g. wayvr apps)
             for (k, o) in &set.inactive_overlays {
-                if !overlays.contains_key(k) {
+                if !crate::frame_shell::is_virtual_overlay_name(k) && !overlays.contains_key(k) {
                     overlays.insert(k.clone(), o.clone());
                 }
             }
@@ -605,7 +605,10 @@ impl<T> OverlayWindowManager<T> {
             let hidden_overlays: HashMap<_, _> = set
                 .hidden_overlays
                 .iter()
-                .filter(|(k, _)| !overlays.contains_key(k.as_ref()))
+                .filter(|(k, _)| {
+                    !crate::frame_shell::is_virtual_overlay_name(k)
+                        && !overlays.contains_key(k.as_ref())
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
@@ -628,10 +631,16 @@ impl<T> OverlayWindowManager<T> {
 
         // serialize global set into `sets` with key GLOBAL_SET
         // overlays: active states + inactive states; hidden_overlays: explicitly toggled off
-        let mut global_overlays: HashMap<_, _> =
-            self.global_set.inactive_overlays.iter().cloned().collect();
+        let mut global_overlays: HashMap<_, _> = self
+            .global_set
+            .inactive_overlays
+            .iter()
+            .filter(|(k, _)| !crate::frame_shell::is_virtual_overlay_name(k))
+            .cloned()
+            .collect();
         for o in self.overlays.values() {
             if o.config.global
+                && !crate::frame_shell::is_virtual_overlay_name(&o.config.name)
                 && let Some(state) = &o.config.active_state
             {
                 global_overlays.insert(o.config.name.clone(), state.clone());
@@ -641,7 +650,10 @@ impl<T> OverlayWindowManager<T> {
             .global_set
             .hidden_overlays
             .iter()
-            .filter(|(k, _)| !global_overlays.contains_key(k.as_ref()))
+            .filter(|(k, _)| {
+                !crate::frame_shell::is_virtual_overlay_name(k)
+                    && !global_overlays.contains_key(k.as_ref())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         app.session.config.sets.push(SerializedWindowSet {
@@ -651,7 +663,14 @@ impl<T> OverlayWindowManager<T> {
         });
 
         // BackendAttrib
+        app.session
+            .config
+            .attribs
+            .retain(|(key, _)| !crate::frame_shell::is_virtual_overlay_name(key));
         for o in self.overlays.values() {
+            if crate::frame_shell::is_virtual_overlay_name(&o.config.name) {
+                continue;
+            }
             let attrs: Vec<_> = SAVED_ATTRIBS
                 .iter()
                 .filter_map(|a| o.config.backend.get_attrib(*a))
@@ -986,6 +1005,52 @@ impl<T> OverlayWindowManager<T> {
             .map(|(k, _)| k)
     }
 
+    /// Returns the overlay's current 3D transform whether currently visible or stashed in a set.
+    pub fn overlay_transform(&self, name: &str) -> Option<Affine3A> {
+        let id = self.lookup(name)?;
+        let overlay = self.overlays.get(id)?;
+        if let Some(state) = &overlay.config.active_state {
+            return Some(state.transform);
+        }
+        for set in std::iter::once(&self.global_set).chain(self.sets.iter()) {
+            if let Some(state) = set.overlays.get(id) {
+                return Some(state.transform);
+            }
+            if let Some(state) = set.hidden_overlays.arc_get(name) {
+                return Some(state.transform);
+            }
+            if let Some(state) = set.inactive_overlays.arc_get(name) {
+                return Some(state.transform);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn restore_overlay_transform(&mut self, id: OverlayID, transform: Affine3A) {
+        let Some(overlay) = self.overlays.get_mut(id) else {
+            return;
+        };
+        if let Some(state) = &mut overlay.config.active_state {
+            state.transform = transform;
+            overlay.config.dirty = true;
+            return;
+        }
+        let name = overlay.config.name.clone();
+        let set = if overlay.config.global {
+            &mut self.global_set
+        } else {
+            &mut self.sets[self.restore_set]
+        };
+        if let Some(state) = set.overlays.get_mut(id) {
+            state.transform = transform;
+        }
+        for states in [&mut set.hidden_overlays, &mut set.inactive_overlays] {
+            if let Some((_, state)) = states.iter_mut().find(|(key, _)| key == &name) {
+                state.transform = transform;
+            }
+        }
+    }
+
     pub fn add(&mut self, overlay: OverlayWindowData<T>, app: &mut AppState) -> OverlayID {
         self.add_with_spawn_pos(overlay, app, SpawnPos::Fixed)
     }
@@ -1082,6 +1147,22 @@ impl<T> OverlayWindowManager<T> {
             }
             SpawnPos::Parent(parent) => {
                 let _ = self.offset_spawn_from_parent(app, oid, &parent);
+            }
+            SpawnPos::Detached(source, surface, placement) => {
+                let (pose, _) = crate::frame_shell::detach_pose(app, self, source, &placement);
+                crate::frame_shell::remember_detach(self, source, surface, placement, pose.translation);
+                let config = &mut self.overlays[oid].config;
+                if let Some(state) = config.active_state.as_mut() {
+                    state.transform = pose;
+                    if matches!(state.positioning, wlx_common::windowing::Positioning::Anchored) {
+                        // Anchored overlays use the full set transform each frame.
+                        state.saved_transform = Some(app.anchor.inverse() * pose);
+                    } else {
+                        save_transform(state, app);
+                    }
+                }
+                config.dirty = true;
+                crate::frame_shell::layout_changed();
             }
         }
     }
@@ -1235,6 +1316,7 @@ impl<T> OverlayWindowManager<T> {
         if new_set == self.current_set || new_set.is_some_and(|x| x >= self.sets.len()) {
             return;
         }
+        crate::frame_shell::drag_edit::cancel(app, self);
 
         if let Some(current_set) = self.current_set.as_ref() {
             let ws = &mut self.sets[*current_set];

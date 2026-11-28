@@ -445,10 +445,10 @@ impl OpenXrInputSource {
             hmd_tracked = false;
         }
 
-        if loc
+        app.input_state.hmd_position_valid = loc
             .location_flags
-            .contains(xr::SpaceLocationFlags::POSITION_VALID)
-        {
+            .contains(xr::SpaceLocationFlags::POSITION_VALID);
+        if app.input_state.hmd_position_valid {
             app.input_state.hmd.translation = hmd.translation;
         } else {
             hmd_tracked = false;
@@ -699,10 +699,12 @@ impl OpenXrPointer {
         lerp_factor: Option<f32>,
     ) -> anyhow::Result<()> {
         let location = self.space.locate(&xr.stage, xr.predicted_display_time)?;
-        if location
-            .location_flags
-            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
-        {
+        let required_flags = xr::SpaceLocationFlags::ORIENTATION_VALID
+            | xr::SpaceLocationFlags::POSITION_VALID;
+        pointer.position_tracked = location.location_flags.contains(
+            xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::POSITION_TRACKED,
+        );
+        if location.location_flags.contains(required_flags) {
             let (cur_quat, cur_pos) = (Quat::from_affine3(&pointer.pose), pointer.pose.translation);
 
             let (new_quat, new_pos) = unsafe {

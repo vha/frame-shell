@@ -162,6 +162,10 @@ pub enum OverlayEventData {
 }
 
 pub trait OverlayBackend: Any {
+    fn surface_scale(&self) -> f32 {
+        1.0
+    }
+
     /// Called once, before the first frame is rendered
     fn init(&mut self, app: &mut AppState) -> anyhow::Result<()>;
     fn pause(&mut self, app: &mut AppState) -> anyhow::Result<()>;

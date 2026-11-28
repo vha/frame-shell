@@ -531,6 +531,9 @@ impl Connection {
             PacketClient::WlxOverlaySetVisible(overlay, visible) => {
                 Self::handle_wlx_overlay_set_visible(params, overlay, visible);
             }
+            PacketClient::VirtualPanel(serial, request) => {
+                params.signals.send(WayVRSignal::VirtualPanel(self.id, serial, request));
+            }
             PacketClient::WlxAppList(serial) => {
                 let apps = crate::frame_shell::app_list_json();
                 self.send(&PacketServer::WlxAppListResponse(serial, apps))?;
@@ -680,9 +683,7 @@ impl WayVRServer {
     /// Clients of the frame shell's PC, through its host services
     fn tick_remote(&mut self, params: &mut TickParams) {
         for event in crate::frame_host::take_ipc_events() {
-            let is_remote = |c: &Connection, source: u32, id: u32| {
-                matches!(c.transport, Transport::Remote(s, r) if s == source && r == id)
-            };
+            let is_remote = |c: &Connection, source: u32, id: u32| matches!(c.transport, Transport::Remote(s, r) if s == source && r == id);
             match event {
                 IpcEvent::Open(source, id) => self
                     .connections
@@ -729,6 +730,18 @@ impl WayVRServer {
             {
                 let _ = conn.send(&packet);
             }
+        }
+    }
+
+    pub(crate) fn has_connection(&self, id: u64) -> bool {
+        self.connections.iter().any(|c| c.id == id && c.alive)
+    }
+
+    pub(crate) fn remote_source(&self, id: u64) -> Option<u32> {
+        let conn = self.connections.iter().find(|c| c.id == id && c.alive)?;
+        match conn.transport {
+            Transport::Remote(source, _) => Some(source),
+            Transport::Local { .. } => None,
         }
     }
 

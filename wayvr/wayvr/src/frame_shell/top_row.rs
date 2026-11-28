@@ -226,6 +226,11 @@ pub fn top_row_signature(app: &AppState) -> u64 {
             &host.status,
         )
             .hash(&mut hasher);
+        if let Some(vstate) = host.source.and_then(crate::frame_host::virtual_state) {
+            for panel in &vstate.panels {
+                (panel.surface, &panel.title, &panel.output_name).hash(&mut hasher);
+            }
+        }
         for client in &host.clients {
             (
                 &client.name,

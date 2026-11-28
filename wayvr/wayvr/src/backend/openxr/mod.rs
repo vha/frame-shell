@@ -160,6 +160,7 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
         lines.allocate(&xr_state, &app)?,
         lines.allocate(&xr_state, &app)?,
     ];
+    let mut panel_outline_lines = None;
 
     let watch_id = overlays.lookup(WATCH_NAME).unwrap(); // want panic
 
@@ -438,6 +439,32 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
                 app.input_state.hmd,
             );
         }
+        let panel_preview = crate::frame_shell::drag_edit::resize_preview(&app, &overlays)
+            .or_else(|| {
+                let (source, preview) = crate::frame_host::detach_preview()?;
+                Some(crate::frame_shell::detach_pose(&app, &overlays, source, &preview))
+            });
+        if let Some((pose, dimensions)) = panel_preview {
+            if panel_outline_lines.is_none() {
+                panel_outline_lines = Some([
+                    lines.allocate(&xr_state, &app)?,
+                    lines.allocate(&xr_state, &app)?,
+                    lines.allocate(&xr_state, &app)?,
+                    lines.allocate(&xr_state, &app)?,
+                ]);
+            }
+            let right = pose.x_axis.normalize_or_zero() * dimensions.x * 0.5;
+            let up = pose.y_axis.normalize_or_zero() * dimensions.y * 0.5;
+            let corners = [-right - up, right - up, right + up, -right + up]
+                .map(|offset| pose.translation + offset);
+            for (i, id) in panel_outline_lines
+                .expect("panel preview lines")
+                .into_iter()
+                .enumerate()
+            {
+                lines.draw_between(id, corners[i], corners[(i + 1) % 4], 0, app.input_state.hmd);
+            }
+        }
 
         app.hid_provider.inner.commit();
 
@@ -572,6 +599,10 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
         app.tick();
         crate::frame_shell::poll_surfaces(&mut app);
         crate::frame_shell::poll_desktop_visibility(&overlays);
+        crate::frame_shell::poll_window_moves(&app, &mut overlays);
+        if app.panel_drag.is_none() {
+            crate::frame_shell::poll_virtual_layout(&overlays);
+        }
         app.tasks.retrieve_due(&mut due_tasks);
         while let Some(task) = due_tasks.pop_front() {
             match task {

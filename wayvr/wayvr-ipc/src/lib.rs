@@ -9,3 +9,5 @@ mod util;
 
 #[cfg(feature = "client")]
 pub mod client;
+
+pub mod virtual_panel;

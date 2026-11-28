@@ -71,6 +71,78 @@ link to Monado's socket (Lepton mounts it as the Android runtime), and `podman`,
 bus and runtime folder when Steam runs in Plasma. `gamescope-0` links to WayVR's socket (KWin's in Plasma), the
 Wayland display Lepton expects.
 
+### PC keyboard controls for virtual panels
+
+Run `wayvrctl virtual-panel pick` in a PC terminal visible in the headset. The picker uses `fzf` for type-to-search,
+arrow keys, Enter and Escape. It offers active panel actions and blank, window and workspace shares, including a
+custom resolution. Bind free shortcuts in Hyprland Lua to open the picker and arm mouse drag.
+
+```lua
+hl.bind("SUPER + SHIFT + V", hl.dsp.exec_cmd("alacritty -e wayvrctl virtual-panel pick"))
+hl.bind("SUPER + ALT + V", hl.dsp.exec_cmd("wayvrctl virtual-panel drag"))
+```
+
+Point at a virtual output and press the drag shortcut. Then hold the left mouse button and move the mouse.
+While held, the cursor is hidden and the panel can move beyond the edges of the desktop outputs.
+The panel turns to face the headset as it moves and stays at its starting distance until you scroll.
+Scroll for depth, hold Shift while scrolling for scale, or hold Ctrl for smaller adjustments. You can scroll
+as soon as the shortcut is armed. With no mouse button held, the adjustment commits when you pause scrolling.
+Hold the right mouse button instead to resize the output. Drag right or down to add width or height.
+The outline previews the new resolution. Release to apply it. A resized window share uses **Fixed resolution**.
+Release the mouse button to commit. Escape cancels. To move a panel when the cursor is on a physical screen,
+choose the panel in the picker and select **Drag with mouse**. The capture arms before the mouse press. Your
+regular Hyprland window-drag binding can stay in place.
+
+The non-interactive commands work without `fzf`. Use the PC source and surface IDs from `list`.
+
+```sh
+wayvrctl --pretty virtual-panel list
+wayvrctl virtual-panel add 1 --size 1600x1000 blank
+wayvrctl virtual-panel nudge 1 2147483648 right --fine
+wayvrctl virtual-panel focus 1 2147483648
+wayvrctl virtual-panel resize 1 2147483648 1280x1440
+wayvrctl virtual-panel fit 1 2147483648 window
+```
+
+`nudge` also accepts `up`, `down`, `left`, `nearer`, `farther`, `larger` and `smaller`. Move and scale commands
+apply to the visible VR panel. With layout sync enabled, the host repositions the virtual output after the existing
+debounce. The list holds the last reported window and workspace targets. Run `wayvrctl virtual-panel refresh 1` if
+you need to refresh them before opening the picker.
+
+Use **Display resolution** on a visible panel to change its actual virtual output mode. Dimensions must be even,
+640–3840 pixels wide and 480–2160 high. A window share defaults to **Fit to window** and follows the settled size
+of a single floating app. Tiled, fullscreen or constrained apps retain the last working mode, and the picker shows
+the fit status. Choosing a resolution switches that panel to **Fixed resolution**. Mode changes preserve reachable
+mouse edges and can shift adjacent virtual outputs to make room. If the layout has no room, move the panel first.
+
+Drag a single floating app in **Fit to window** mode with your usual window gesture to move its VR panel.
+Frame Shell moves the panel and turns it toward the headset when the window and pointer settle. Use the
+drag shortcut above for moves beyond the desktop edges. **Auto-sync VR layout to desktop** snaps the virtual
+output to a valid desktop position. Resizing the app on one axis keeps the other VR dimension the same.
+
+To detach an app from its desktop, load the helper after your existing Hyprland move binding. Pass the
+same chord and the path to the Frame Shell build of `wayvrctl`.
+
+```lua
+dofile("/path/to/frame-shell/scripts/hyprland-detach.lua")("SUPER + mouse:272", "/path/to/wayvrctl")
+```
+
+Drag toward an edge that opens onto empty space. Pause near the edge until **Drop to create panel** and the
+VR outline appear, then release the mouse button to detach. Pull back to cancel or cross an edge that connects
+to another output to move the app there normally. The new panel faces the headset at the parent output’s
+viewing distance. A tiled app stays tiled and starts in **Fixed resolution**. A floating app stays floating
+and starts in **Fit to window**.
+
+Store optional PC picker defaults in `${XDG_CONFIG_HOME:-~/.config}/frame-shell/virtual-panels.json`.
+
+```json
+{
+  "drag_gain": 0.0015,
+  "default_resolution": [1920, 1080],
+  "resolutions": [[2560, 1440], [1280, 1440]]
+}
+```
+
 ## Several PCs
 
 A PC is identified by its WiVRn server cookie, which its packaged server and `just run` share

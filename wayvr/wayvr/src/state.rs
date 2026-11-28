@@ -63,7 +63,7 @@ pub struct AppState {
     pub floor_from_stage: Affine3A,
     pub floor_from_raw: Affine3A,
     pub floor_calibration: crate::floor_estimate::FloorCalibration,
-    pub anchor_grabbed: bool,
+    pub(crate) panel_drag: Option<crate::frame_shell::drag_edit::Drag>,
 
     pub wgui_globals: WguiGlobals,
     pub wgui_theme: Rc<WguiTheme>,
@@ -222,10 +222,8 @@ impl AppState {
             anchor: Affine3A::IDENTITY,
             floor_from_stage: Affine3A::IDENTITY,
             floor_from_raw: Affine3A::IDENTITY,
-            floor_calibration: crate::floor_estimate::FloorCalibration::new(
-                session.config.floor_calibration_on_start,
-            ),
-            anchor_grabbed: false,
+            floor_calibration: crate::floor_estimate::FloorCalibration::default(),
+            panel_drag: None,
             wgui_theme: Rc::new(theme),
             wgui_globals: params.wgui_globals,
             executor,

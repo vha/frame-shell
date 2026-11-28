@@ -91,7 +91,7 @@ impl OverlayWindowData<OpenXrOverlayData> {
             smallvec![(swapchain.get_subimage(0), EyeVisibility::BOTH),]
         };
 
-        let transform = state.transform
+        let transform = self.config.surface_transform(state.transform)
             * self
                 .config
                 .backend

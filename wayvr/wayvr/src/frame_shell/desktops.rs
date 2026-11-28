@@ -8,22 +8,48 @@ pub(crate) extern "C" fn desktop_surface(info: *const DesktopSurface) {
     };
     let key = surface_key(info.source, info.surface);
     if info.removed {
-        if let Some((frame, _)) = surfaces().remove(&key).and_then(|surface| surface.frame) {
-            release_frame(frame.id);
+        if let Some(surface) = surfaces().remove(&key) {
+            if let Some((frame, _)) = surface.frame {
+                release_frame(frame.id);
+            }
+            if surface.virtual_panel {
+                RETIRED_VIRTUALS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(surface.name);
+                mark_virtual_layout_dirty();
+            }
         }
         return;
     }
-    // Overlay names carry their saved layout, so name them after the PC and its monitor
     let text = frame_abi::c_string::<64>;
-    let name: Arc<str> = format!("{} {}", text(&info.source_name), text(&info.name))
+    let connector = text(&info.name);
+    if wayvr_ipc::frame::is_virtual_surface(info.surface) {
+        let name = virtual_overlay_name(info.source, info.surface, &connector);
+        log::info!("Virtual panel {name}: {}x{}", info.width, info.height);
+        surfaces().entry(key).or_insert(Surface {
+            visible: None,
+            name,
+            connector,
+            registered: true,
+            virtual_panel: true,
+            frame: None,
+            spawned: 0,
+        });
+        mark_virtual_layout_dirty();
+        return;
+    }
+    // Overlay names carry their saved layout, so name them after the PC and its monitor
+    let name: Arc<str> = format!("{} {}", text(&info.source_name), connector)
         .trim()
         .into();
     log::info!("Desktop {name}: {}x{}", info.width, info.height);
     surfaces().entry(key).or_insert(Surface {
         visible: None,
         name,
-        connector: text(&info.name),
+        connector,
         registered: false,
+        virtual_panel: false,
         frame: None,
         spawned: 0,
     });
@@ -93,6 +119,327 @@ pub fn poll_desktop_visibility<T: Default>(
     }
 }
 
+static COMMITTED_PLACEMENTS: Mutex<BTreeMap<u32, BTreeMap<u32, CommittedPlacement>>> =
+    Mutex::new(BTreeMap::new());
+static DETACHMENTS: Mutex<BTreeMap<(u32, u32), Detachment>> = Mutex::new(BTreeMap::new());
+
+struct Detachment {
+    placement: wayvr_ipc::virtual_panel::DetachPlacement,
+    parent_overlay: Option<Arc<str>>,
+    center: glam::Vec3A,
+}
+
+pub fn clear_virtual_layout(source: u32) {
+    COMMITTED_PLACEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&source);
+    DETACHMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(pc, _), _| *pc != source);
+}
+
+fn detach_parent_name(source: u32, anchor: &str) -> Option<Arc<str>> {
+    let state = crate::frame_host::virtual_state(source);
+    state
+        .as_ref()
+        .and_then(|state| {
+            state
+                .panels
+                .iter()
+                .find(|panel| panel.output_name == anchor)
+                .map(|panel| virtual_overlay_name(source, panel.surface, &panel.output_name))
+        })
+        .or_else(|| {
+            crate::frame_hosts::for_source(source)
+                .map(|pc| Arc::<str>::from(format!("{} {anchor}", pc.id)))
+        })
+}
+
+pub fn remember_detach<T>(
+    overlays: &crate::windowing::manager::OverlayWindowManager<T>,
+    source: u32,
+    surface: u32,
+    placement: wayvr_ipc::virtual_panel::DetachPlacement,
+    center: glam::Vec3A,
+) {
+    let parent = detach_parent_name(source, &placement.anchor)
+        .and_then(|name| overlays.overlay_transform(&name).map(|pose| (name, pose)));
+    let (parent_overlay, center) = parent.map_or((None, center), |(name, pose)| {
+        (Some(name), pose.inverse().transform_point3a(center))
+    });
+    DETACHMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((source, surface), Detachment { placement, parent_overlay, center });
+}
+
+pub fn detach_pose<T>(
+    app: &AppState,
+    overlays: &crate::windowing::manager::OverlayWindowManager<T>,
+    source: u32,
+    placement: &wayvr_ipc::virtual_panel::DetachPlacement,
+) -> (glam::Affine3A, glam::Vec2) {
+    let parent_name = detach_parent_name(source, &placement.anchor);
+    let anchor = parent_name.and_then(|name| {
+        overlays.iter().find_map(|(_, overlay)| {
+            (overlay.config.name == name)
+                .then_some(overlay.config.active_state.as_ref())
+                .flatten()
+                .map(|state| overlay.config.surface_transform(state.transform))
+        })
+    });
+    let anchor = anchor.unwrap_or_else(|| {
+        app.input_state.hmd * glam::Affine3A::from_translation(glam::vec3(0.0, 0.0, -1.5))
+    });
+    detached_panel_pose(
+        anchor,
+        &app.input_state.hmd,
+        app.session.config.snap_angle_deg,
+        placement,
+    )
+}
+
+fn detached_panel_pose(
+    anchor: glam::Affine3A,
+    headset: &glam::Affine3A,
+    snap_angle: f32,
+    placement: &wayvr_ipc::virtual_panel::DetachPlacement,
+) -> (glam::Affine3A, glam::Vec2) {
+    use wayvr_ipc::virtual_panel::DropEdge;
+
+    let [w, h] = placement.size.map(|dimension| dimension.max(1) as f32);
+    let [anchor_w, anchor_h] = placement
+        .anchor_size
+        .map(|dimension| dimension.max(1) as f32);
+    let density = anchor.x_axis.length().max(0.1) / anchor_w.max(anchor_h);
+    let major = (w.max(h) * density).clamp(0.3, 3.0);
+    let dimensions = glam::vec2(w, h) * (major / w.max(h));
+    let right = anchor.x_axis.normalize_or_zero();
+    let up = anchor.y_axis.normalize_or_zero();
+    let across = placement.offset as f32 * density;
+    let horizontal = (anchor_w * density + dimensions.x) * 0.5 + 0.04;
+    let vertical = (anchor_h * density + dimensions.y) * 0.5 + 0.04;
+    let (x, y) = match placement.edge {
+        DropEdge::Left => (-horizontal, -across),
+        DropEdge::Right => (horizontal, -across),
+        DropEdge::Top => (across, vertical),
+        DropEdge::Bottom => (across, -vertical),
+    };
+    let offset = right * x + up * y;
+    let mut pose = glam::Affine3A {
+        matrix3: glam::Mat3A::from_cols(right, up, right.cross(up)).mul_scalar(major),
+        translation: anchor.translation + offset,
+    };
+    let from_headset = anchor.translation - headset.translation;
+    if let Some(radial) = from_headset.try_normalize()
+        && let Some(tangent) = (offset - radial * offset.dot(radial)).try_normalize()
+    {
+        // Follow the parent's depth around the headset, using the requested
+        // edge spacing as arc length rather than moving along the flat panel.
+        let radius = from_headset.length();
+        let angle = (offset.length() / radius).min(std::f32::consts::FRAC_PI_2);
+        let (sin, cos) = angle.sin_cos();
+        pose.translation = headset.translation + radius * (radial * cos + tangent * sin);
+    }
+    realign(&mut pose, headset, major, snap_angle);
+    (pose, dimensions)
+}
+
+pub fn poll_window_moves<T: Default>(
+    app: &AppState,
+    overlays: &mut crate::windowing::manager::OverlayWindowManager<T>,
+) {
+    for movement in crate::frame_host::take_window_moves() {
+        let Some(panel) = crate::frame_host::virtual_state(movement.source).and_then(|state| {
+            state.panels.into_iter().find(|panel| {
+                panel.surface == movement.surface && panel.fit_to_window == Some(true)
+            })
+        }) else {
+            continue;
+        };
+        let name = virtual_overlay_name(movement.source, panel.surface, &panel.output_name);
+        let Some(id) = overlays.lookup(&name) else {
+            continue;
+        };
+        if app.input_state.is_grabbing_anchor()
+            || app.panel_drag.is_some()
+            || app.input_state.is_grabbing_overlay(id)
+        {
+            continue;
+        }
+        let Some(overlay) = overlays.mut_by_id(id) else {
+            continue;
+        };
+        let scale = overlay.config.backend.surface_scale();
+        let Some(state) = overlay
+            .config
+            .active_state
+            .as_mut()
+            .filter(|state| state.alpha > 0.05 && state.grabbable)
+        else {
+            continue;
+        };
+        let [width, height] = movement.output_size;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let [dx, dy] = movement
+            .delta
+            .map(|v| v as f32 / width.max(height) as f32 * scale);
+        let transform = &mut state.transform;
+        transform.translation +=
+            (transform.x_axis * dx - transform.y_axis * dy).clamp_length_max(3.0);
+        let scale = scalar_scale(transform);
+        realign(
+            transform,
+            &app.input_state.hmd,
+            scale,
+            app.session.config.snap_angle_deg,
+        );
+        save_transform(state, app);
+        overlay.config.dirty = true;
+        layout_changed();
+    }
+}
+
+/// Solves and pushes 2D compositor panel coordinates when virtual panel 3D poses settle (~350 ms debounce).
+pub fn poll_virtual_layout<T: Default>(
+    overlays: &crate::windowing::manager::OverlayWindowManager<T>,
+) {
+    if !EMBEDDED.load(Ordering::Relaxed) || !virtual_auto_sync() {
+        return;
+    }
+    let dirty_at = VIRTUAL_LAYOUT_DIRTY_MS.load(Ordering::Relaxed);
+    if dirty_at == 0 || (START.elapsed().as_millis() as u64) < dirty_at + 350 {
+        return;
+    }
+
+    let mut waiting_for_spawn = false;
+    for (source, _) in crate::frame_host::sources() {
+        let Some(vstate) = crate::frame_host::virtual_state(source) else {
+            continue;
+        };
+        if !vstate.capabilities.supported || vstate.panels.is_empty() {
+            clear_virtual_layout(source);
+            continue;
+        }
+        let cookie = crate::frame_hosts::for_source(source).map(|pc| pc.id);
+        let physical: Vec<PhysicalAnchor> = vstate
+            .physical_monitors
+            .iter()
+            .map(|m| {
+                let overlay_name = cookie.as_deref().map(|id| format!("{id} {}", m.name));
+                let transform = overlay_name
+                    .as_deref()
+                    .and_then(|name| overlays.overlay_transform(name));
+                PhysicalAnchor {
+                    key: m.name.clone(),
+                    logical_pos: m.logical_pos,
+                    logical_size: m.logical_size,
+                    overlay_transform: transform,
+                }
+            })
+            .collect();
+        let mut virtuals = Vec::with_capacity(vstate.panels.len());
+        let live_surfaces: BTreeSet<u32> = surfaces()
+            .keys()
+            .filter(|&&key| (key >> 32) as u32 == source)
+            .map(|&key| key as u32)
+            .collect();
+        let mut detachments = DETACHMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        detachments.retain(|(pc, surface), _| {
+            *pc != source
+                || vstate.panels.iter().any(|panel| panel.surface == *surface)
+                || live_surfaces.contains(surface)
+        });
+        for panel in &vstate.panels {
+            let name = virtual_overlay_name(source, panel.surface, &panel.output_name);
+            let Some(transform) = overlays.overlay_transform(&name) else {
+                waiting_for_spawn = true;
+                continue;
+            };
+            let key = (source, panel.surface);
+            let attachment = detachments.get(&key).and_then(|detach| {
+                use wayvr_ipc::virtual_panel::DropEdge;
+                use super::layout_solver::{Attachment, EdgeSide};
+
+                let mut center = transform.translation;
+                if let Some(name) = &detach.parent_overlay {
+                    center = overlays.overlay_transform(name)?.inverse().transform_point3a(center);
+                }
+                if center.distance_squared(detach.center) > 0.01_f32.powi(2) {
+                    return None;
+                }
+                let anchor = &detach.placement.anchor;
+                let parent_key = vstate.panels.iter().find(|p| &p.output_name == anchor)
+                    .map(|p| format!("v:{}", p.surface))
+                    .or_else(|| physical.iter().any(|p| &p.key == anchor).then(|| anchor.clone()))?;
+                Some(Attachment {
+                    parent_key,
+                    edge: match detach.placement.edge {
+                        DropEdge::Top => EdgeSide::Top,
+                        DropEdge::Bottom => EdgeSide::Bottom,
+                        DropEdge::Left => EdgeSide::Left,
+                        DropEdge::Right => EdgeSide::Right,
+                    },
+                    offset: detach.placement.offset,
+                })
+            });
+            if attachment.is_none() {
+                detachments.remove(&key);
+            }
+            virtuals.push(VirtualPanelPose {
+                surface: panel.surface,
+                logical_size: panel.logical_size,
+                overlay_transform: transform,
+                attachment,
+            });
+        }
+        drop(detachments);
+        // A panel without an overlay pose still occupies space in Hyprland.
+        if virtuals.len() != vstate.panels.len() {
+            continue;
+        }
+        let prev = COMMITTED_PLACEMENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&source)
+            .cloned()
+            .unwrap_or_default();
+        let solution = solve_layout(&physical, &virtuals, None, &prev);
+        COMMITTED_PLACEMENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(source, solution.committed);
+        let changed = solution.targets.iter().any(|target| {
+            vstate
+                .panels
+                .iter()
+                .find(|p| p.surface == target.surface)
+                .is_some_and(|p| p.logical_pos != [target.x, target.y])
+        });
+        if changed {
+            crate::frame_host::send(
+                source,
+                &wayvr_ipc::frame::ShellMessage::SyncPanelLayout {
+                    placements: solution.targets,
+                    logical_sizes: virtuals
+                        .iter()
+                        .map(|p| (p.surface, p.logical_size))
+                        .collect(),
+                },
+            );
+        }
+    }
+
+    if !waiting_for_spawn {
+        let _ = VIRTUAL_LAYOUT_DIRTY_MS.compare_exchange(
+            dirty_at,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 pub fn poll_surfaces(app: &mut AppState) {
     if !EMBEDDED.load(Ordering::Relaxed) {
         return;
@@ -118,6 +465,21 @@ pub fn poll_surfaces(app: &mut AppState) {
         app.tasks
             .enqueue(TaskType::Overlay(OverlayTask::SaveLayout));
     }
+    let retired_virtuals = std::mem::take(
+        &mut *RETIRED_VIRTUALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for name in retired_virtuals {
+        app.session
+            .config
+            .attribs
+            .retain(|(key, _)| key.as_ref() != name.as_ref());
+        app.tasks
+            .enqueue(TaskType::Overlay(OverlayTask::DropImmediate(
+                OverlaySelector::Name(name),
+            )));
+    }
     #[cfg(feature = "feat-monado-metrics")]
     {
         let frames = crate::frame_host::take_frames();
@@ -140,6 +502,18 @@ pub fn poll_surfaces(app: &mut AppState) {
                     metrics.ingest_remote(frame.into());
                 }
             }
+        }
+    }
+    for (source, surface) in crate::frame_host::take_virtual_reveals() {
+        if let Some(name) = surfaces()
+            .get(&surface_key(source, surface))
+            .filter(|surface| surface.spawned > 0)
+            .map(|surface| surface.name.clone())
+        {
+            app.tasks.enqueue(TaskType::Overlay(OverlayTask::ToggleOverlay(
+                OverlaySelector::Name(name),
+                crate::backend::task::ToggleMode::EnsureOn,
+            )));
         }
     }
     for error in crate::frame_host::take_errors() {
@@ -231,9 +605,12 @@ pub fn poll_surfaces(app: &mut AppState) {
     {
         surface.spawned = run;
         let name = surface.name.clone();
+        let source = (key >> 32) as u32;
+        let spawn = crate::frame_host::take_detach_placement(source, key as u32)
+            .map_or(SpawnPos::Spread, |placement| SpawnPos::Detached(source, key as u32, placement));
         app.tasks.enqueue(TaskType::Overlay(OverlayTask::Spawn(
             OverlaySelector::Name(name.clone()),
-            SpawnPos::Spread,
+            spawn,
             Box::new(move |app| Some(desktop_overlay(name, key, app))),
         )));
     }
@@ -357,18 +734,7 @@ pub(crate) fn desktop_overlay(name: Arc<str>, key: u64, app: &AppState) -> Overl
             ),
             ..Default::default()
         },
-        ..OverlayWindowConfig::from_backend(Box::new(DesktopOverlay {
-            name: name.clone(),
-            key,
-            offline: None,
-            redraw: false,
-            meta: None,
-            planes: None,
-            shown: None,
-            imports: HashMap::new(),
-            renderer: None,
-            last_hover: None,
-        }))
+        ..OverlayWindowConfig::from_backend(Box::new(DesktopOverlay::new(name, key)))
     }
 }
 
@@ -381,6 +747,8 @@ pub(crate) struct DesktopOverlay {
     /// Redraw without a new frame: edit mode left its panel in the swapchain image
     redraw: bool,
     meta: Option<FrameMeta>,
+    /// Use the first stream's pixel density for later virtual output modes.
+    initial_long_edge: Option<std::num::NonZeroU32>,
     /// Luma and chroma views of the frame being shown
     planes: Option<(Arc<ImageView>, Arc<ImageView>)>,
     /// Decoder buffer of the frame being shown, released once a newer one is: WayVR waits for the previous
@@ -397,6 +765,14 @@ pub(crate) struct DesktopOverlay {
 fn screen_state(name: &str) -> [String; 3] {
     use crate::frame_hosts::Connection;
     use wayvr_ipc::frame::MonitorStatus;
+    if let Some((source, _, _)) = parse_virtual_overlay_name(name) {
+        let line = |status: &str| [status.to_owned(), String::new(), String::new()];
+        return if crate::frame_host::is_connected(source) {
+            line("Waiting for virtual panel…")
+        } else {
+            line("Disconnected")
+        };
+    }
     let Some(pc) = crate::frame_hosts::owner(name) else {
         return ["Unknown PC".into(), String::new(), String::new()];
     };
@@ -432,6 +808,22 @@ fn screen_state(name: &str) -> [String; 3] {
 }
 
 impl DesktopOverlay {
+    fn new(name: Arc<str>, key: u64) -> Self {
+        Self {
+            name,
+            key,
+            offline: None,
+            redraw: false,
+            meta: None,
+            initial_long_edge: None,
+            planes: None,
+            shown: None,
+            imports: HashMap::new(),
+            renderer: None,
+            last_hover: None,
+        }
+    }
+
     /// The placeholder, rebuilt when what it says changes
     fn placeholder(&mut self, app: &mut AppState) -> anyhow::Result<ShouldRender> {
         let state = screen_state(&self.name);
@@ -446,13 +838,27 @@ impl DesktopOverlay {
         let [width, height] = self.meta.map_or([1920, 1080], |meta| meta.extent);
         let panel_w = 1280u32;
         let panel_h = (u64::from(panel_w) * u64::from(height) / u64::from(width.max(1))) as u32;
+        let title = if let Some((source, id, connector)) = parse_virtual_overlay_name(&self.name) {
+            crate::frame_host::virtual_state(source)
+                .and_then(|state| {
+                    state
+                        .panels
+                        .into_iter()
+                        .find(|panel| panel.surface == id)
+                        .map(|panel| panel.title)
+                })
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| connector.to_owned())
+        } else {
+            crate::frame_hosts::screen_title(&self.name)
+        };
         let mut panel = GuiPanel::new_from_template(
             app,
             "gui/frame-screen-offline.xml",
             (),
             NewGuiPanelParams {
                 extra_vars: [
-                    ("name".into(), crate::frame_hosts::screen_title(&self.name).into()),
+                    ("name".into(), title.into()),
                     ("status".into(), state[0].clone().into()),
                     ("detail".into(), state[1].clone().into()),
                     ("hint".into(), state[2].clone().into()),
@@ -478,6 +884,13 @@ impl Drop for DesktopOverlay {
 }
 
 impl OverlayBackend for DesktopOverlay {
+    fn surface_scale(&self) -> f32 {
+        self.initial_long_edge.zip(self.meta).map_or(1.0, |(initial, meta)| {
+            let [width, height] = meta.extent;
+            width.max(height) as f32 / initial.get() as f32
+        })
+    }
+
     fn init(&mut self, _: &mut AppState) -> anyhow::Result<()> {
         Ok(())
     }
@@ -567,6 +980,9 @@ impl OverlayBackend for DesktopOverlay {
             if self.renderer.is_none() || self.meta.is_none_or(|old| old.extent != extent) {
                 self.renderer = Some(Nv12ScreenPipeline::new(&meta, app)?);
             }
+            if wayvr_ipc::frame::is_virtual_surface(self.key as u32) && self.initial_long_edge.is_none() {
+                self.initial_long_edge = std::num::NonZeroU32::new(frame.width.max(frame.height));
+            }
             self.meta = Some(meta);
             Ok(ShouldRender::Should)
         } else {
@@ -589,7 +1005,12 @@ impl OverlayBackend for DesktopOverlay {
         self.renderer
             .as_mut()
             .unwrap()
-            .render(luma, chroma, app, resources)
+            .render(luma, chroma, app, resources)?;
+        let surface = self.key as u32;
+        if wayvr_ipc::frame::is_virtual_surface(surface) && let Some(meta) = self.meta {
+            crate::frame_host::virtual_frame_rendered((self.key >> 32) as u32, surface, meta.extent);
+        }
+        Ok(())
     }
     fn frame_meta(&mut self) -> Option<FrameMeta> {
         match &mut self.offline {
@@ -629,7 +1050,7 @@ impl OverlayBackend for DesktopOverlay {
     fn on_pointer(&mut self, app: &mut AppState, hit: &PointerHit, pressed: bool) {
         if self.offline.is_some() {
             // Only ever connects: another screen of the same PC may already be streaming
-            if pressed {
+            if pressed && !is_virtual_overlay_name(&self.name) {
                 connect_screen_host(app, &self.name);
             }
             return;
@@ -654,5 +1075,58 @@ impl OverlayBackend for DesktopOverlay {
     }
     fn set_attrib(&mut self, _: &mut AppState, _: BackendAttribValue) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_panel_faces_the_headset_at_its_parents_depth() {
+        use wayvr_ipc::virtual_panel::{DetachPlacement, DropEdge};
+
+        let headset = glam::Affine3A::from_translation(glam::vec3(0.3, 1.5, 0.1));
+        let mut anchor = glam::Affine3A::from_translation(glam::vec3(-0.5, 1.35, -1.7));
+        realign(&mut anchor, &headset, 1.5, 0.0);
+        for (edge, direction) in [
+            (DropEdge::Right, anchor.x_axis),
+            (DropEdge::Left, -anchor.x_axis),
+            (DropEdge::Top, anchor.y_axis),
+            (DropEdge::Bottom, -anchor.y_axis),
+        ] {
+            let placement = DetachPlacement {
+                anchor: "parent".into(),
+                anchor_size: [1600, 900],
+                edge,
+                size: [1200, 800],
+                offset: 120,
+            };
+            let (pose, dimensions) = detached_panel_pose(anchor, &headset, 0.0, &placement);
+            let radius = anchor.translation.distance(headset.translation);
+            let to_headset = headset.translation - pose.translation;
+            assert!((to_headset.length() - radius).abs() < 1e-5);
+            assert!(pose.z_axis.normalize().dot(to_headset.normalize()) > 0.9999);
+            assert!((pose.translation - anchor.translation).dot(direction) > 0.0);
+            assert!((pose.x_axis.length() - dimensions.max_element()).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn virtual_desktop_keeps_pixel_density_as_either_edge_grows() {
+        let mut desktop = DesktopOverlay::new("test panel".into(), 0);
+        desktop.initial_long_edge = std::num::NonZeroU32::new(1200);
+        for extent in [[1200, 800], [1600, 800], [1200, 1400]] {
+            desktop.meta = Some(FrameMeta {
+                extent,
+                ..Default::default()
+            });
+            let uv_per_unit = desktop.get_interaction_transform().unwrap().matrix2;
+            let dimensions = [uv_per_unit.x_axis.x, -uv_per_unit.y_axis.y]
+                .map(|axis| desktop.surface_scale() / axis);
+            for axis in 0..2 {
+                assert!((dimensions[axis] - extent[axis] as f32 / 1200.0).abs() < 0.0001);
+            }
+        }
     }
 }

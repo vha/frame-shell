@@ -4,12 +4,15 @@
 
 mod capture;
 mod clients;
+mod compositor;
 mod games;
 mod ipc_proxy;
 mod metrics;
 mod metrics_proto;
 mod notifications;
 mod notify;
+mod virtual_panels;
+mod wayland_capture;
 
 use frame_abi::{frame_host, frame_host_callbacks, frame_host_surface};
 use std::{
@@ -94,6 +97,14 @@ impl Output {
         });
     }
 
+    pub fn surface_region(&self, id: u32, region: [f32; 4]) {
+        self.call(|c| {
+            if let Some(callback) = c.surface_region {
+                unsafe { callback(c.user, id, region.as_ptr()) };
+            }
+        });
+    }
+
     pub fn removed(&self, id: u32) {
         self.call(|c| {
             if let Some(callback) = c.surface_removed {
@@ -109,6 +120,20 @@ impl Output {
             }
         });
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_callbacks(callbacks: frame_host_callbacks) -> Self {
+        Self {
+            callbacks: Arc::new(Callbacks(callbacks)),
+            stop: Arc::default(),
+            open: Arc::new(RwLock::new(true)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 /// State the shell sets and the capture workers read
@@ -118,7 +143,14 @@ pub struct Shared {
     pub visibility: Mutex<HashMap<u32, bool>>,
     /// Monitors whose next frame must be a keyframe
     pub keyframes: Mutex<HashSet<u32>>,
+    /// Last keyframe sent by each virtual capture worker.
+    pub virtual_keyframe_sizes: Mutex<HashMap<u32, (u32, u32)>>,
+    pub resizing_virtual_outputs: Mutex<HashSet<u32>>,
+    pub virtual_resize_ack: AtomicBool,
+    pub virtual_window_follow: AtomicBool,
+    pub decoded_virtual_resize: Mutex<Option<(u32, u64)>>,
     pub capture: Mutex<CaptureStatus>,
+    pub output_layout: Mutex<capture::OutputLayout>,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -153,6 +185,33 @@ impl Shared {
             hevc: false,
         })
     }
+
+    pub fn update_outputs(&self, output: &Output, outputs: Vec<capture::OutputGeometry>) {
+        let mut layout = lock(&self.output_layout);
+        for (id, region) in layout.update(outputs) {
+            output.surface_region(id, region);
+        }
+    }
+
+    pub fn register_stream(&self, id: u32, output_name: String) {
+        lock(&self.output_layout).register_stream(id, output_name);
+    }
+
+    pub fn unregister_stream(&self, id: u32) {
+        lock(&self.output_layout).unregister_stream(id);
+    }
+
+    pub fn region_for_output(&self, output_name: &str) -> Option<[f32; 4]> {
+        lock(&self.output_layout).region_for_output(output_name)
+    }
+
+    /// Re-pushes the latest computed region while holding `output_layout`, eliminating races with concurrent layout updates.
+    pub fn sync_surface_region(&self, output: &Output, id: u32) {
+        let layout = lock(&self.output_layout);
+        if let Some(region) = layout.region_for_stream(id) {
+            output.surface_region(id, region);
+        }
+    }
 }
 
 struct Host {
@@ -162,6 +221,7 @@ struct Host {
     games: Sender<games::Command>,
     focus: Sender<clients::Command>,
     proxy: Arc<ipc_proxy::Proxy>,
+    virtuals: virtual_panels::VirtualManager,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -182,7 +242,10 @@ impl Host {
         let (games, games_rx) = mpsc::channel();
         let (focus, focus_rx) = mpsc::channel();
         let proxy = Arc::new(ipc_proxy::Proxy::default());
-        let mut threads = Vec::new();
+        // Run virtual manager startup & orphan sweep before `capture::run` enumerates physical monitors.
+        let (virtuals, virtual_handle) =
+            virtual_panels::VirtualManager::start(output.clone(), shared.clone());
+        let mut threads = vec![virtual_handle];
         let mut spawn = |name: &str, body: Box<dyn FnOnce() + Send>| {
             threads.push(
                 std::thread::Builder::new()
@@ -224,6 +287,7 @@ impl Host {
             games,
             focus,
             proxy,
+            virtuals,
             threads,
         })
     }
@@ -258,6 +322,7 @@ impl Host {
                     .send(&HostMessage::Identity(self.identity.clone()));
                 let capture = lock(&self.shared.capture).clone();
                 self.output.send(&HostMessage::Capture(capture));
+                self.virtuals.send(virtual_panels::Command::RequestState);
                 let _ = self.focus.send(clients::Command::Refresh);
                 let _ = self.games.send(games::Command::Refresh);
             }
@@ -266,11 +331,57 @@ impl Host {
             }
             ShellMessage::Ipc(connection, packet) => self.proxy.send(connection, &packet),
             ShellMessage::IpcClose(connection) => self.proxy.close(connection),
+            ShellMessage::RefreshVirtualTargets => {
+                self.virtuals.send(virtual_panels::Command::RefreshTargets);
+            }
+            ShellMessage::CreateVirtualPanel { source, size } => {
+                self.virtuals
+                    .send(virtual_panels::Command::Create { source, size });
+            }
+            ShellMessage::CloseVirtualPanel { surface } => {
+                self.virtuals
+                    .send(virtual_panels::Command::Close { surface });
+            }
+            ShellMessage::FocusVirtualPanel { surface } => {
+                self.virtuals
+                    .send(virtual_panels::Command::Focus { surface });
+            }
+            ShellMessage::SetVirtualPanelSizing { surface, sizing } => {
+                self.virtuals
+                    .send(virtual_panels::Command::SetSizing { surface, sizing });
+            }
+            ShellMessage::SyncPanelLayout {
+                placements,
+                logical_sizes,
+            } => {
+                self.virtuals.send(virtual_panels::Command::SyncLayout {
+                    placements,
+                    logical_sizes,
+                });
+            }
+            ShellMessage::EnableVirtualResizeAck => {
+                self.shared
+                    .virtual_resize_ack
+                    .store(true, Ordering::Release);
+            }
+            ShellMessage::EnableVirtualWindowFollow => {
+                self.shared.virtual_window_follow.store(true, Ordering::Release);
+            }
+            ShellMessage::VirtualDetach(gesture) => {
+                self.virtuals.send(virtual_panels::Command::Detach(gesture));
+            }
+            ShellMessage::VirtualResizeDecoded { surface, serial } => {
+                let mut ack = lock(&self.shared.decoded_virtual_resize);
+                if ack.is_none_or(|(_, previous)| previous < serial) {
+                    *ack = Some((surface, serial));
+                }
+            }
         }
     }
 
     fn stop(self) {
         self.output.stop.store(true, Ordering::Release);
+        self.virtuals.send(virtual_panels::Command::Shutdown);
         *self
             .output
             .open

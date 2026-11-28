@@ -111,6 +111,7 @@ pub enum SpawnPos {
     Spread,
     /// Spawn relative to a different overlay
     Parent(OverlaySelector),
+    Detached(u32, u32, wayvr_ipc::virtual_panel::DetachPlacement),
 }
 
 pub enum GlobalChange {

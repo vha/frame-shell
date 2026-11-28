@@ -10,9 +10,10 @@ use std::{
 use wayvr_ipc::{
     frame::{
         CaptureStatus, DesktopSettings, HostMessage, Notification, RuntimeClient, SessionFrame,
-        ShellMessage,
+        ShellMessage, VirtualState, VirtualTargets,
     },
     packet_client::PacketClient,
+    virtual_panel::DetachPlacement,
 };
 
 /// A wayvr-ipc client on a PC (source), tunnelled to the IPC server
@@ -34,6 +35,11 @@ struct Pc {
     sent_background: Option<bool>,
     sent_settings: Option<DesktopSettings>,
     capture: Option<CaptureStatus>,
+    virtual_state: Option<VirtualState>,
+    virtual_targets: Option<VirtualTargets>,
+    pending_resize_frames: BTreeMap<u32, ([u32; 2], u64)>,
+    detach_preview: Option<DetachPlacement>,
+    detached_panels: BTreeMap<u32, DetachPlacement>,
 }
 
 struct State {
@@ -44,6 +50,8 @@ struct State {
     frames: VecDeque<SessionFrame>,
     errors: VecDeque<String>,
     notifications: VecDeque<Notification>,
+    virtual_reveals: Vec<(u32, u32)>,
+    window_moves: Vec<WindowMove>,
     ipc: VecDeque<IpcEvent>,
 }
 
@@ -53,6 +61,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     frames: VecDeque::new(),
     errors: VecDeque::new(),
     notifications: VecDeque::new(),
+    virtual_reveals: Vec::new(),
+    window_moves: Vec::new(),
     ipc: VecDeque::new(),
 });
 
@@ -108,6 +118,11 @@ pub fn connected(source: u32, _background: bool) {
             sent_background: None,
             sent_settings: None,
             capture: None,
+            virtual_state: None,
+            virtual_targets: None,
+            pending_resize_frames: BTreeMap::new(),
+            detach_preview: None,
+            detached_panels: BTreeMap::new(),
         },
     );
     drop(state);
@@ -129,6 +144,8 @@ pub fn receive(source: u32, data: &[u8]) {
         return;
     };
     let vr = crate::frame_hosts::background_source() == Some(source);
+    let mut enable_resize_ack = false;
+    let mut enable_window_follow = false;
     match message {
         HostMessage::Games(games) => {
             let changed = pc.games.as_ref().is_none_or(|(_, old)| *old != games);
@@ -192,9 +209,112 @@ pub fn receive(source: u32, data: &[u8]) {
         }
         HostMessage::IpcClose(id) => state.ipc.push_back(IpcEvent::Close(source, id)),
         HostMessage::Capture(capture) => pc.capture = Some(capture),
+        HostMessage::VirtualState(virtual_state) => {
+            enable_window_follow = virtual_state.capabilities.window_follow
+                && !pc
+                    .virtual_state
+                    .as_ref()
+                    .is_some_and(|old| old.capabilities.window_follow);
+            enable_resize_ack = virtual_state.capabilities.resize_panel
+                && !pc
+                    .virtual_state
+                    .as_ref()
+                    .is_some_and(|prev| prev.capabilities.resize_panel);
+            pc.pending_resize_frames
+                .retain(|surface, _| virtual_state.panels.iter().any(|p| p.surface == *surface));
+            if pc.virtual_state.as_ref() != Some(&virtual_state) {
+                if pc.virtual_state.as_ref().is_none_or(|old| {
+                    old.panels != virtual_state.panels
+                        || old.physical_monitors != virtual_state.physical_monitors
+                }) {
+                    crate::frame_shell::mark_virtual_layout_dirty();
+                }
+                pc.virtual_state = Some(virtual_state);
+                crate::frame_shell::bump_lobby_state();
+            }
+        }
+        HostMessage::RevealVirtualPanel(surface) => {
+            if state.virtual_reveals.len() < 16 {
+                state.virtual_reveals.push((source, surface));
+            }
+        }
+        HostMessage::VirtualTargets(targets) => {
+            if pc.virtual_targets.as_ref() != Some(&targets) {
+                pc.virtual_targets = Some(targets);
+                crate::frame_shell::bump_lobby_state();
+            }
+        }
+        HostMessage::VerifyVirtualResize {
+            surface,
+            size,
+            serial,
+        } => {
+            if pc
+                .virtual_state
+                .as_ref()
+                .is_some_and(|state| state.panels.iter().any(|p| p.surface == surface))
+            {
+                pc.pending_resize_frames.insert(surface, (size, serial));
+            }
+        }
+        HostMessage::VirtualWindowMoved {
+            surface,
+            delta,
+            output_size,
+        } => {
+            if state.window_moves.len() < 32 {
+                state.window_moves.push(WindowMove {
+                    source,
+                    surface,
+                    delta,
+                    output_size,
+                });
+            }
+        }
+        HostMessage::DetachPreview(preview) => {
+            if pc.detach_preview.is_none() && preview.is_some() && state.errors.len() < 8 {
+                state.errors.push_back("Drop to create panel".into());
+            }
+            pc.detach_preview = preview;
+        }
+        HostMessage::DetachedPanel { surface, placement } => {
+            if pc.detached_panels.len() >= 8
+                && let Some(first) = pc.detached_panels.keys().next().copied()
+            {
+                pc.detached_panels.remove(&first);
+            }
+            pc.detached_panels.insert(surface, placement);
+        }
     }
     drop(guard);
+    if enable_resize_ack {
+        send(source, &ShellMessage::EnableVirtualResizeAck);
+    }
+    if enable_window_follow {
+        send(source, &ShellMessage::EnableVirtualWindowFollow);
+    }
     sync_presentation();
+}
+
+pub fn virtual_frame_rendered(source: u32, surface: u32, size: [u32; 2]) {
+    let serial = {
+        let mut state = state();
+        let Some(pc) = state.pcs.get_mut(&source) else {
+            return;
+        };
+        let Some((expected, serial)) = pc.pending_resize_frames.get(&surface).copied() else {
+            return;
+        };
+        if expected != size {
+            return;
+        }
+        pc.pending_resize_frames.remove(&surface);
+        serial
+    };
+    send(
+        source,
+        &ShellMessage::VirtualResizeDecoded { surface, serial },
+    );
 }
 
 pub fn composition_supported(source: u32) -> bool {
@@ -275,6 +395,20 @@ pub fn capture(source: u32) -> Option<CaptureStatus> {
     state().pcs.get(&source).and_then(|pc| pc.capture.clone())
 }
 
+pub fn virtual_state(source: u32) -> Option<VirtualState> {
+    state()
+        .pcs
+        .get(&source)
+        .and_then(|pc| pc.virtual_state.clone())
+}
+
+pub fn virtual_targets(source: u32) -> Option<VirtualTargets> {
+    state()
+        .pcs
+        .get(&source)
+        .and_then(|pc| pc.virtual_targets.clone())
+}
+
 /// Steam app ids of a PC's running games
 pub fn games(source: u32) -> Option<Vec<String>> {
     state()
@@ -325,6 +459,36 @@ pub fn take_frames() -> Vec<SessionFrame> {
 
 pub fn take_errors() -> Vec<String> {
     state().errors.drain(..).collect()
+}
+
+pub fn take_virtual_reveals() -> Vec<(u32, u32)> {
+    std::mem::take(&mut state().virtual_reveals)
+}
+
+pub struct WindowMove {
+    pub source: u32,
+    pub surface: u32,
+    pub delta: [i32; 2],
+    pub output_size: [u32; 2],
+}
+
+pub fn take_window_moves() -> Vec<WindowMove> {
+    std::mem::take(&mut state().window_moves)
+}
+
+pub fn detach_preview() -> Option<(u32, DetachPlacement)> {
+    state()
+        .pcs
+        .iter()
+        .find_map(|(&source, pc)| pc.detach_preview.clone().map(|preview| (source, preview)))
+}
+
+pub fn take_detach_placement(source: u32, surface: u32) -> Option<DetachPlacement> {
+    state()
+        .pcs
+        .get_mut(&source)?
+        .detached_panels
+        .remove(&surface)
 }
 
 pub fn take_notifications() -> Vec<Notification> {

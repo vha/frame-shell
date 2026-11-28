@@ -85,6 +85,18 @@ where
                     &PacketServer::WlxWindowAttribSetResponse(serial, result),
                 );
             }
+            WayVRSignal::VirtualPanel(connection_id, serial, request) => {
+                let result = crate::frame_shell::panel_controls::handle_request(
+                    app,
+                    overlays,
+                    connection_id,
+                    request,
+                );
+                app.ipc_server.send_response(
+                    connection_id,
+                    &PacketServer::VirtualPanelResponse(serial, result),
+                );
+            }
             WayVRSignal::ListOverlays(connection_id, serial, list_params) => {
                 let list = overlays.list_overlays(list_params.visible, list_params.hidden);
                 app.ipc_server.send_response(
@@ -134,6 +146,8 @@ where
             },
         }
     }
+
+    crate::frame_shell::drag_edit::expire(app, overlays);
 
     let tick_tasks = WvrServerState::tick_events(app)?;
     if let Some(wayvr_server) = app.wvr_server.as_mut() {
