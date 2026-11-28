@@ -1,6 +1,9 @@
-use std::time::{Duration, Instant};
+use std::{
+    f32::consts::FRAC_PI_2,
+    time::{Duration, Instant},
+};
 
-use glam::Affine3A;
+use glam::{Affine3A, Vec3A};
 
 use crate::{
     frame_host,
@@ -20,12 +23,58 @@ pub(crate) struct Drag {
     surface: u32,
     overlay: OverlayID,
     original: Affine3A,
+    orbit: Orbit,
     updated: Instant,
 }
 
 impl Drag {
     pub fn targets(&self, source: u32, surface: u32) -> bool {
         (self.source, self.surface) == (source, surface)
+    }
+}
+
+// Keep the drag centered on the headset's starting position so moving your
+// head during the drag doesn't translate the panel.
+struct Orbit {
+    center: Vec3A,
+    distance: f32,
+    max_distance: f32,
+    yaw: f32,
+    elevation: f32,
+}
+
+impl Orbit {
+    fn new(center: Vec3A, position: Vec3A) -> Self {
+        let offset = position - center;
+        let distance = offset.length();
+        Self {
+            center,
+            distance,
+            max_distance: distance + 10.0,
+            yaw: offset.x.atan2(-offset.z),
+            elevation: offset.y.atan2(offset.x.hypot(offset.z)),
+        }
+    }
+
+    fn move_by(&mut self, [dx, dy, dz]: [f32; 3]) -> Vec3A {
+        const MIN_DISTANCE: f32 = 0.1;
+        let horizontal_radius = self.distance * self.elevation.cos();
+        self.yaw += dx / horizontal_radius.max(MIN_DISTANCE);
+        self.elevation =
+            (self.elevation + dy / self.distance.max(MIN_DISTANCE)).clamp(-FRAC_PI_2, FRAC_PI_2);
+        if dz != 0.0 {
+            // The scroll direction is positive toward the headset.
+            self.distance = (self.distance - dz).clamp(MIN_DISTANCE, self.max_distance);
+        }
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+        let (sin_elevation, cos_elevation) = self.elevation.sin_cos();
+        self.center
+            + self.distance
+                * Vec3A::new(
+                    sin_yaw * cos_elevation,
+                    sin_elevation,
+                    -cos_yaw * cos_elevation,
+                )
     }
 }
 
@@ -58,6 +107,7 @@ pub fn begin<T: Default>(
         surface,
         overlay,
         original: state.transform,
+        orbit: Orbit::new(app.input_state.hmd.translation, state.transform.translation),
         updated: Instant::now(),
     });
     config.pause_movement = true;
@@ -97,15 +147,18 @@ pub fn motion<T: Default>(
         .ok_or("The panel is no longer visible.")?;
     drag.updated = Instant::now();
     if translation != [0.0; 3] || scale_steps != 0.0 {
-        apply(
-            &mut state.transform,
-            drag.original,
-            translation,
-            scale_steps,
-        );
-        let scale = scalar_scale(&state.transform);
+        let transform = &mut state.transform;
+        if translation != [0.0; 3] {
+            transform.translation = drag.orbit.move_by(translation);
+        }
+        let mut scale = scalar_scale(transform);
+        if scale > f32::EPSILON && scale_steps != 0.0 {
+            let target = (scale * 1.1_f32.powf(scale_steps)).clamp(0.1, 20.0);
+            transform.matrix3 = transform.matrix3.mul_scalar(target / scale);
+            scale = target;
+        }
         realign(
-            &mut state.transform,
+            transform,
             &app.input_state.hmd,
             scale,
             app.session.config.snap_angle_deg,
@@ -113,21 +166,6 @@ pub fn motion<T: Default>(
         overlay.config.dirty = true;
     }
     Ok(())
-}
-
-fn apply(transform: &mut Affine3A, original: Affine3A, [dx, dy, dz]: [f32; 3], scale_steps: f32) {
-    let right = original.x_axis.normalize_or_zero();
-    let up = original.y_axis.normalize_or_zero();
-    let normal = right.cross(up).normalize_or_zero();
-    let offset =
-        (transform.translation - original.translation + dx * right + dy * up + dz * normal)
-            .clamp_length_max(10.0);
-    transform.translation = original.translation + offset;
-    let scale = transform.x_axis.length();
-    if scale > f32::EPSILON && scale_steps != 0.0 {
-        let target = (scale * 1.1_f32.powf(scale_steps)).clamp(0.1, 20.0);
-        transform.matrix3 = transform.matrix3.mul_scalar(target / scale);
-    }
 }
 
 pub fn finish<T: Default>(
@@ -181,5 +219,38 @@ pub fn expire<T: Default>(app: &mut AppState, overlays: &mut OverlayWindowManage
             })
     }) {
         end(app, overlays, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_drag_across_headset_keeps_distance_and_height() {
+        let headset = Vec3A::new(0.2, 1.6, 0.3);
+        let start = headset + Vec3A::new(-1.3, -0.2, -1.1);
+        let distance = start.distance(headset);
+        let mut orbit = Orbit::new(headset, start);
+        let mut end = start;
+        for _ in 0..8 {
+            end = orbit.move_by([0.35, 0.0, 0.0]);
+            assert!((end.distance(headset) - distance).abs() < 1e-5);
+            assert!((end.y - start.y).abs() < 1e-5);
+        }
+        assert!(end.x > headset.x + 1.0);
+        assert!(end.z < headset.z);
+    }
+
+    #[test]
+    fn scroll_changes_distance_and_vertical_drag_keeps_it() {
+        let mut orbit = Orbit::new(Vec3A::ZERO, Vec3A::new(0.0, 0.0, -2.0));
+        let raised = orbit.move_by([0.0, 0.4, 0.0]);
+        assert!(raised.y > 0.0);
+        assert!((raised.length() - 2.0).abs() < 1e-5);
+        let nearer = orbit.move_by([0.0, 0.0, 0.5]);
+        assert!(nearer.abs_diff_eq(raised * 0.75, 1e-5));
+        let farther = orbit.move_by([0.0, 0.0, -0.5]);
+        assert!(farther.abs_diff_eq(raised, 1e-5));
     }
 }

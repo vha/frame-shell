@@ -84,7 +84,7 @@ hl.bind("SUPER + ALT + V", hl.dsp.exec_cmd("wayvrctl virtual-panel drag"))
 
 Point at a virtual output and press the drag shortcut. Then hold the left mouse button and move the mouse.
 While held, the cursor is hidden and the panel can move beyond the edges of the desktop outputs.
-The panel turns to face the headset as it moves.
+The panel turns to face the headset as it moves and stays at its starting distance until you scroll.
 Scroll while dragging for depth, hold Shift while scrolling for scale, or hold Ctrl for smaller adjustments.
 Release the mouse button to commit. Escape cancels. To move a panel when the cursor is on a physical screen,
 choose the panel in the picker and select **Drag with mouse**. The capture arms before the mouse press. Your
