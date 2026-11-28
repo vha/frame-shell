@@ -353,17 +353,6 @@ impl CompositorBackend for HyprlandBackend {
         self.request_ok(&command)
     }
 
-    fn resize_floating_window(&self, address: &str, [width, height]: [u32; 2]) -> Result<()> {
-        let address = normalize_window_address(address);
-        let command = if self.lua_dispatch {
-            let window = lua_quote(&format!("address:{address}"));
-            format!("/dispatch hl.dsp.window.resize({{ window = {window}, x = {width}, y = {height}, relative = false }})")
-        } else {
-            format!("/dispatch resizewindowpixel exact {width} {height},address:{address}")
-        };
-        self.request_ok(&command)
-    }
-
     fn move_workspace_to_output(&self, workspace_id: i32, output: &str) -> Result<()> {
         let prev_focused = self
             .list_monitors()?

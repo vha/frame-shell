@@ -573,22 +573,22 @@ impl Worker {
                         backend.move_window_to_workspace(&address, &default_ws_id.to_string())?;
                         if let Some(drop) = &detach {
                             if restore_tiled {
-                                backend.set_window_floating(&address, true)?;
-                                backend.resize_floating_window(&address, drop.window.size)?;
+                                backend.set_window_floating(&address, false)?;
+                            } else {
+                                let pos = sizing::recenter(
+                                    backend.as_ref(),
+                                    vmon,
+                                    &drop.window,
+                                    drop.border,
+                                )?;
+                                preserve_cursor(
+                                    backend.as_ref(),
+                                    vmon,
+                                    drop.cursor,
+                                    drop.window.pos,
+                                    pos,
+                                );
                             }
-                            let pos = sizing::recenter(
-                                backend.as_ref(),
-                                vmon,
-                                &drop.window,
-                                drop.border,
-                            )?;
-                            preserve_cursor(
-                                backend.as_ref(),
-                                vmon,
-                                drop.cursor,
-                                drop.window.pos,
-                                pos,
-                            );
                             self.output.send(&HostMessage::DetachedPanel {
                                 surface,
                                 placement: drop.placement.clone(),
@@ -673,8 +673,14 @@ impl Worker {
                     return Err(error);
                 }
             };
-            let fit =
-                matches!(ownership, PanelOwnership::Window { .. }).then(sizing::FitWindow::default);
+            let fit = match &ownership {
+                PanelOwnership::Window { restore_tiled, .. } => {
+                    let mut fit = sizing::FitWindow::default();
+                    fit.enabled = !restore_tiled;
+                    Some(fit)
+                }
+                _ => None,
+            };
 
             Ok(ActivePanel {
                 surface,
@@ -1517,9 +1523,16 @@ mod tests {
             let (x, y) = anchor.logical_pos;
             let start = [x + 160, y + 100];
             let edge = [x + 1, y + 100];
-            for id in [1, 2, 3] {
+            for id in [1, 2, 3, 4] {
                 backend.set_window_floating(address, true).unwrap();
-                backend.resize_floating_window(address, [560, 390]).unwrap();
+                let resize = format!(
+                    "hl.dsp.window.resize({{ window = 'address:{address}', x = 560, y = 390, relative = false }})"
+                );
+                let reply = std::process::Command::new("hyprctl")
+                    .args(["dispatch", &resize])
+                    .output()
+                    .unwrap();
+                assert_eq!(String::from_utf8_lossy(&reply.stdout).trim(), "ok");
                 backend
                     .move_floating_window(address, [x + 100, y + 40])
                     .unwrap();
@@ -1581,8 +1594,11 @@ mod tests {
                     assert_eq!(backend.list_monitors().unwrap().len(), 1);
                     continue;
                 }
-                // Hyprland retiles a tiled window before dispatching the release.
-                backend.set_window_floating(address, false).unwrap();
+                let was_tiled = id != 4;
+                if was_tiled {
+                    // Hyprland retiles a tiled window before dispatching the release.
+                    backend.set_window_floating(address, false).unwrap();
+                }
                 shared.virtual_resize_ack.store(id == 3, Ordering::Release);
                 let release = if id == 2 {
                     // Retiling changed the position and size. Keep the drop armed
@@ -1594,6 +1610,7 @@ mod tests {
                 } else {
                     edge
                 };
+                let first_message = lock(events_ref).messages.len();
                 manager_ref.send(Command::Detach(DetachGesture::Release {
                     id,
                     cursor: release,
@@ -1622,13 +1639,18 @@ mod tests {
                 let surface = loop {
                     let events = lock(events_ref);
                     if let Some(surface) =
-                        events.messages.iter().rev().find_map(|event| match event {
+                        events.messages[first_message..].iter().rev().find_map(|event| match event {
                             HostMessage::DetachedPanel { surface, placement }
                                 if placement == &preview && events.videos.contains(surface) =>
                             {
                                 Some(*surface)
                             }
                             _ => None,
+                        })
+                        && events.messages[first_message..].iter().any(|event| {
+                            matches!(event, HostMessage::VirtualState(state) if state.panels.iter().any(|p| {
+                                p.surface == surface && p.fit_to_window == Some(!was_tiled)
+                            }))
                         })
                     {
                         break surface;
@@ -1657,11 +1679,11 @@ mod tests {
                 assert_eq!(detached.logical_pos.0 + detached.logical_size.0, x);
                 assert!(backend.list_windows().unwrap().iter().any(|window| {
                     &window.address == address
-                        && window.floating
+                        && window.floating != was_tiled
                         && window.monitor_name == detached.name
                 }));
                 assert_eq!(preview.size, [640, 480]);
-                if let Some(helper) = std::env::var_os("FRAME_TEST_WINDOW_DRAG") {
+                if !was_tiled && let Some(helper) = std::env::var_os("FRAME_TEST_WINDOW_DRAG") {
                     shared.virtual_window_follow.store(true, Ordering::Release);
                     // Let the initial fit settle before measuring the starting position.
                     std::thread::sleep(Duration::from_millis(1100));
@@ -1718,7 +1740,7 @@ mod tests {
                 }
                 assert!(backend.list_windows().unwrap().iter().any(|window| {
                     &window.address == address
-                        && !window.floating
+                        && window.floating != was_tiled
                         && window.workspace_id == original.workspace_id
                 }));
             }
