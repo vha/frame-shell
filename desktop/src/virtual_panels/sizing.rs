@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use wayvr_ipc::virtual_panel::{SIZE_REQUIREMENTS, Sizing, valid_size};
+use wayvr_ipc::virtual_panel::{SIZE_REQUIREMENTS, Sizing, normalized_size, valid_size};
 
 use super::{
     ActivePanel, PanelOwnership, Worker, preserve_cursor, to_output_geos,
@@ -218,9 +218,7 @@ impl Worker {
                     .map(|size| (size, window, [monitor.width, monitor.height]))
             });
             let (size, window, output_size) = match proposal {
-                Some((size, window, output_size)) if valid_size(size) => {
-                    (size, window, output_size)
-                }
+                Some((Some(size), window, output_size)) => (size, window, output_size),
                 other => {
                     let reason = if other.is_some() {
                         SIZE_REQUIREMENTS
@@ -573,15 +571,22 @@ fn capture_finished(panel: &ActivePanel) -> bool {
         .is_none_or(|thread| thread.is_finished())
 }
 
-pub(super) fn fitted_size(window: &WindowInfo, monitor: &MonitorGeometry, border: u32) -> [u32; 2] {
+pub(super) fn fitted_size(
+    window: &WindowInfo,
+    monitor: &MonitorGeometry,
+    border: u32,
+) -> Option<[u32; 2]> {
     let reserved = monitor.reserved.map(|v| v.max(0) as u32);
-    std::array::from_fn(|axis| {
+    let outer: [u32; 2] = std::array::from_fn(|axis| {
         let outer = window.size[axis]
             .saturating_add(border.saturating_mul(2))
             .saturating_add(reserved[axis])
             .saturating_add(reserved[axis + 2]);
         outer.saturating_add(1) & !1
-    })
+    });
+    // Small windows can use the minimum mode. An oversized window would be clipped.
+    let size = normalized_size(outer);
+    (size[0] >= outer[0] && size[1] >= outer[1]).then_some(size)
 }
 
 pub(super) fn recenter(

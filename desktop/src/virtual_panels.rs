@@ -1519,7 +1519,7 @@ mod tests {
             let edge = [x + 1, y + 100];
             for id in [1, 2, 3] {
                 backend.set_window_floating(address, true).unwrap();
-                backend.resize_floating_window(address, [800, 520]).unwrap();
+                backend.resize_floating_window(address, [560, 390]).unwrap();
                 backend
                     .move_floating_window(address, [x + 100, y + 40])
                     .unwrap();
@@ -1660,6 +1660,54 @@ mod tests {
                         && window.floating
                         && window.monitor_name == detached.name
                 }));
+                assert_eq!(preview.size, [640, 480]);
+                if let Some(helper) = std::env::var_os("FRAME_TEST_WINDOW_DRAG") {
+                    shared.virtual_window_follow.store(true, Ordering::Release);
+                    // Let the initial fit settle before measuring the starting position.
+                    std::thread::sleep(Duration::from_millis(1100));
+                    let origin = backend
+                        .list_windows()
+                        .unwrap()
+                        .into_iter()
+                        .find(|window| &window.address == address)
+                        .unwrap();
+                    backend
+                        .move_cursor([origin.pos[0] + 110, origin.pos[1] + 100])
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                    assert!(
+                        std::process::Command::new(helper)
+                            .arg("120")
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(4);
+                    loop {
+                        let events = lock(events_ref);
+                        if events.messages.iter().any(|event| {
+                            matches!(event, HostMessage::VirtualWindowMoved {
+                                surface: moved, delta: [dx, dy], output_size: [640, 480],
+                            } if *moved == surface && *dx > 0 && dy.abs() < 35)
+                        }) {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "drag did not move the detached panel"
+                        );
+                        drop(events);
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    let returned = backend
+                        .list_windows()
+                        .unwrap()
+                        .into_iter()
+                        .find(|window| &window.address == address)
+                        .unwrap();
+                    assert_eq!(returned.workspace_id, origin.workspace_id);
+                    assert_eq!(returned.pos, origin.pos, "{origin:?} -> {returned:?}");
+                }
                 manager_ref.send(Command::Close { surface });
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while !lock(events_ref).removed.contains(&surface)

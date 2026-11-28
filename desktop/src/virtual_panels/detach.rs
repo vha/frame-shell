@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use wayvr_ipc::{
     frame::{HostMessage, VirtualTargetKind},
-    virtual_panel::{DetachGesture, DetachPlacement, DropEdge, normalized_size},
+    virtual_panel::{DetachGesture, DetachPlacement, DropEdge},
 };
 
 use super::{Worker, sizing::fitted_size};
@@ -224,11 +224,7 @@ impl Worker {
         // The new output has no reserved space and runs at scale 1.
         let mut new_monitor = anchor.clone();
         new_monitor.reserved = [0; 4];
-        let fitted = fitted_size(&window, &new_monitor, border);
-        let size = normalized_size(fitted);
-        if (0..2).any(|axis| size[axis] < fitted[axis]) {
-            return None;
-        }
+        let size = fitted_size(&window, &new_monitor, border)?;
         let (placement, position) = place_at_edge(&monitors, anchor, edge, cursor, size)?;
         Some(Creation {
             placement,
