@@ -201,7 +201,9 @@ pub fn poll_window_moves<T: Default>(
         let Some(id) = overlays.lookup(&name) else {
             continue;
         };
-        if app.anchor_grabbed || app.panel_drag.is_some() || app.input_state.is_grabbing_overlay(id)
+        if app.input_state.is_grabbing_anchor()
+            || app.panel_drag.is_some()
+            || app.input_state.is_grabbing_overlay(id)
         {
             continue;
         }

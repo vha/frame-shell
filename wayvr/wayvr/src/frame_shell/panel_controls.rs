@@ -239,7 +239,7 @@ fn edit_overlay<T: Default>(
     id: crate::windowing::OverlayID,
     action: Action,
 ) -> Result<(), String> {
-    if app.anchor_grabbed || app.input_state.is_grabbing_overlay(id) {
+    if app.input_state.is_grabbing_anchor() || app.input_state.is_grabbing_overlay(id) {
         return Err("Release the controller grab before editing this panel.".into());
     }
     match action {

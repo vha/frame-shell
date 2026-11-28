@@ -94,6 +94,15 @@ pub struct InputState {
 }
 
 impl InputState {
+    pub(crate) fn is_grabbing_anchor(&self) -> bool {
+        self.pointers.iter().any(|pointer| {
+            pointer
+                .interaction
+                .grabbed
+                .is_some_and(|grab| grab.grab_anchor)
+        })
+    }
+
     pub(crate) fn is_grabbing_overlay(&self, id: OverlayID) -> bool {
         self.pointers.iter().any(|pointer| {
             pointer.interaction.grabbed.is_some_and(|grab| grab.grabbed_id == id)
@@ -417,6 +426,7 @@ fn debug_print_hand(hand: &Pointer) {
 pub struct InteractionState {
     pub mode: PointerMode,
     pub grabbed: Option<GrabData>,
+    grab_needs_release: bool,
     pub clicked_id: Option<OverlayID>,
     pub hovered_id: Option<OverlayID>,
     /// For a button bound to both click and space_drag: whether its current press clicks (true) or drags (false)
@@ -432,6 +442,7 @@ impl Default for InteractionState {
         Self {
             mode: PointerMode::Left,
             grabbed: None,
+            grab_needs_release: false,
             clicked_id: None,
             hovered_id: None,
             shared_press_clicks: None,
@@ -457,6 +468,10 @@ pub struct Pointer {
 }
 
 impl Pointer {
+    fn grab_started(&self) -> bool {
+        self.now.grab && !self.before.grab && !self.interaction.grab_needs_release
+    }
+
     pub fn new(idx: usize) -> Self {
         debug_assert!(idx == 0 || idx == 1);
         Self {
@@ -538,8 +553,31 @@ pub struct GrabData {
     pub offset: Affine3A,
     pub grabbed_id: OverlayID,
     pub grab_anchor: bool,
+    handsfree: bool,
     /// Anchor grabs move and turn the group about its center (in anchor space), not the anchor itself
     pub pivot: Vec3A,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrabEnd {
+    Released,
+    TrackingLost,
+    InputChanged,
+    OverlayUnavailable,
+}
+
+impl GrabData {
+    fn end_reason(&self, pointer: &Pointer, overlay_available: bool) -> Option<GrabEnd> {
+        if !pointer.tracked {
+            Some(GrabEnd::TrackingLost)
+        } else if pointer.handsfree != self.handsfree {
+            Some(GrabEnd::InputChanged)
+        } else if !overlay_available {
+            Some(GrabEnd::OverlayUnavailable)
+        } else {
+            (!pointer.now.grab).then_some(GrabEnd::Released)
+        }
+    }
 }
 
 #[repr(u8)]
@@ -646,17 +684,24 @@ where
         pointer.interaction.block_input = BlockMode::None;
         pointer.interaction.should_block_poses = false;
         pointer.interaction.kbd_block_activated = false;
-        return (None, pending_haptics); // no hit
+    } else if !pointer.now.grab {
+        pointer.interaction.grab_needs_release = false;
     }
 
     // already grabbing, ignore everything else
     if let Some(grab_data) = pointer.interaction.grabbed {
-        if let Some(grabbed) = overlays.mut_by_id(grab_data.grabbed_id) {
+        let overlay = overlays.mut_by_id(grab_data.grabbed_id);
+        let available = overlay
+            .as_ref()
+            .is_some_and(|o| o.config.active_state.is_some());
+        if let Some(reason) = grab_data.end_reason(pointer, available) {
+            finish_grab(idx, overlay, app, reason);
+        } else if let Some(grabbed) = overlay {
             handle_grabbed(idx, grabbed, app);
-        } else {
-            log::warn!("Grabbed overlay {:?} does not exist", grab_data.grabbed_id);
-            pointer.interaction.grabbed = None;
         }
+        return (None, pending_haptics);
+    }
+    if !pointer.tracked {
         return (None, pending_haptics);
     }
 
@@ -694,7 +739,7 @@ where
     }
 
     let grabbing = &app.input_state.pointers[idx];
-    let pivot = if grabbing.now.grab && !grabbing.before.grab {
+    let pivot = if grabbing.grab_started() {
         anchored_center(overlays, &app.anchor)
     } else {
         Vec3A::ZERO
@@ -740,7 +785,7 @@ where
     let hovered_state = hovered.config.active_state.as_mut().unwrap();
 
     let grab_float = pointer.now.grab_float;
-    let grab_start = pointer.now.grab && !pointer.before.grab;
+    let grab_start = pointer.grab_started();
 
     // grab
     if grab_start && hovered_state.grabbable {
@@ -1065,6 +1110,7 @@ fn start_grab(par: StartGrabParams) {
         return;
     }
 
+    let anchor_grabbed = app.input_state.is_grabbing_anchor();
     let pointer = &mut app.input_state.pointers[par.idx];
 
     // Grab anchor if:
@@ -1074,7 +1120,7 @@ fn start_grab(par: StartGrabParams) {
     // - grabbing with one hand. (grabbing with the 2nd hand will grab the individual overlay instead)
     let grab_anchor = !par.edit_mode
         && !par.grab_float
-        && !app.anchor_grabbed
+        && !anchor_grabbed
         && matches!(state.positioning, Positioning::Anchored)
         && !(app.session.config.middle_grabs_single
             && pointer.interaction.mode == PointerMode::Middle);
@@ -1087,14 +1133,16 @@ fn start_grab(par: StartGrabParams) {
 
     let offset = pointer.pose.inverse() * relative_grab_transform;
 
-    app.anchor_grabbed = grab_anchor;
-
     pointer.interaction.grabbed = Some(GrabData {
         offset,
         grabbed_id: id,
         grab_anchor,
+        handsfree: pointer.handsfree,
         pivot: par.pivot,
     });
+    if grab_anchor {
+        log::info!("Hand {}: grabbed set anchor", par.idx);
+    }
 
     app.tasks.enqueue(TaskType::Overlay(OverlayTask::Modify(
         OverlaySelector::Id(id),
@@ -1167,7 +1215,6 @@ fn handle_scale(transform: &mut Affine3A, scroll_y: f32) {
         .mul_scalar(0.025f32.mul_add(-scroll_y, 1.0));
 }
 
-#[allow(clippy::too_many_lines)]
 fn handle_grabbed<O>(idx: usize, overlay: &mut OverlayWindowData<O>, app: &mut AppState)
 where
     O: Default,
@@ -1179,136 +1226,155 @@ where
     };
     let grab_anchor = grab_data.grab_anchor;
 
-    if pointer.now.grab {
-        let Some(overlay_state) = overlay.config.active_state.as_mut() else {
-            // overlay got toggled off while being grabbed. those dastardly users!
-            // just wait for them to release the grab
-            return;
-        };
+    let Some(overlay_state) = overlay.config.active_state.as_mut() else {
+        return;
+    };
 
-        let scroll_factor = 90.0 * app.delta_time;
+    let scroll_factor = 90.0 * app.delta_time;
 
-        if grab_anchor {
-            let pivot_local = Affine3A::from_translation(grab_data.pivot.into());
-            let mut pivot = app.anchor * pivot_local;
-            if pointer.now.any_click() {
-                pointer.interaction.mode = PointerMode::Special;
-                let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0) * 0.2 + 0.4;
-                handle_scale(&mut pivot, pointer.now.scroll_y * grab_dist * scroll_factor);
-                handle_scale(
-                    &mut grab_data.offset,
-                    pointer.now.scroll_y * grab_dist * scroll_factor,
-                );
-            } else if app.session.config.allow_sliding && pointer.now.scroll_y.is_finite() {
-                // single grab push/pull
-                let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0);
-                grab_data.offset.translation.z -=
-                    pointer.now.scroll_y * scroll_factor * 0.02 * grab_dist;
-                grab_data.offset.translation.z = grab_data.offset.translation.z.min(-0.05);
-            }
-            if pointer.now.click_right || pointer.now.click_modifier_right {
-                pivot = pointer.pose * grab_data.offset;
-            } else {
-                pivot.translation = pointer.pose.transform_point3a(grab_data.offset.translation);
-                let scale = scalar_scale(&pivot);
-                let hmd = &app.input_state.hmd;
-                // lying on the side: hmd up becomes up, as in realign
-                let up = if hmd.x_axis.dot(Vec3A::Y).abs() > 0.2
-                    || hmd.z_axis.dot(Vec3A::Y).abs() > 0.9
-                {
-                    hmd.y_axis
-                } else {
-                    Vec3A::Y
-                };
-                if let Some(rotation) = face_about_pivot(
-                    pivot.translation,
-                    -grab_data.pivot * scale,
-                    hmd.translation,
-                    up,
-                    app.session.config.snap_angle_deg,
-                ) {
-                    pivot.matrix3 = rotation.mul_scalar(scale);
-                }
-            }
-            app.anchor = pivot * pivot_local.inverse();
-        } else {
-            // single grab resize
-            if pointer.now.any_click() {
-                pointer.interaction.mode = PointerMode::Special;
-                let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0) * 0.2 + 0.4;
-                handle_scale(
-                    &mut overlay_state.transform,
-                    pointer.now.scroll_y * grab_dist * scroll_factor,
-                );
-                handle_scale(
-                    &mut grab_data.offset,
-                    pointer.now.scroll_y * grab_dist * scroll_factor,
-                );
-            } else if app.session.config.allow_sliding && pointer.now.scroll_y.is_finite() {
-                // single grab push/pull
-                let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0);
-                grab_data.offset.translation.z -=
-                    pointer.now.scroll_y * scroll_factor * 0.02 * grab_dist;
-                grab_data.offset.translation.z = grab_data.offset.translation.z.min(-0.05);
-            }
-            if pointer.now.click_right || pointer.now.click_modifier_right {
-                overlay_state.transform = pointer.pose * grab_data.offset;
-            } else {
-                let scale = scalar_scale(&overlay_state.transform);
-                overlay_state.transform.translation =
-                    pointer.pose.transform_point3a(grab_data.offset.translation);
-                realign(
-                    &mut overlay_state.transform,
-                    &app.input_state.hmd,
-                    scale,
-                    app.session.config.snap_angle_deg,
-                );
-            }
-            overlay.config.pause_movement = true;
-            overlay.config.dirty = true;
+    if grab_anchor {
+        let pivot_local = Affine3A::from_translation(grab_data.pivot.into());
+        let mut pivot = app.anchor * pivot_local;
+        if pointer.now.any_click() {
+            pointer.interaction.mode = PointerMode::Special;
+            let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0) * 0.2 + 0.4;
+            handle_scale(&mut pivot, pointer.now.scroll_y * grab_dist * scroll_factor);
+            handle_scale(
+                &mut grab_data.offset,
+                pointer.now.scroll_y * grab_dist * scroll_factor,
+            );
+        } else if app.session.config.allow_sliding && pointer.now.scroll_y.is_finite() {
+            // single grab push/pull
+            let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0);
+            grab_data.offset.translation.z -=
+                pointer.now.scroll_y * scroll_factor * 0.02 * grab_dist;
+            grab_data.offset.translation.z = grab_data.offset.translation.z.min(-0.05);
         }
-    } else {
-        // not now.grab
-        pointer.interaction.grabbed = None;
-        crate::frame_shell::layout_changed();
-        if grab_anchor {
-            app.anchor_grabbed = false;
+        if pointer.now.click_right || pointer.now.click_modifier_right {
+            pivot = pointer.pose * grab_data.offset;
         } else {
-            // single grab released
-            if &*overlay.config.name == WATCH_NAME {
-                // watch special: when dropped, follow the hand that wasn't grabbing
-                if let Some(overlay_state) = overlay.config.active_state.as_mut() {
-                    let align_to_hmd = overlay_state.align_to_hmd;
-                    overlay_state.positioning = match overlay_state.positioning {
-                        Positioning::FollowHand { hand, lerp } => match pointer.hand() {
-                            Some(LeftRight::Left) => Positioning::FollowHand {
-                                hand: LeftRight::Right,
-                                lerp,
-                            },
-                            Some(LeftRight::Right) => Positioning::FollowHand {
-                                hand: LeftRight::Left,
-                                lerp,
-                            },
-                            _ => Positioning::FollowHand { hand, lerp },
-                        },
-                        x => x,
-                    };
-                    overlay_state.align_to_hmd = align_to_hmd;
-                }
-            } else if overlay.config.global
-                && let Some(active_state) = overlay.config.active_state.as_ref()
+            pivot.translation = pointer.pose.transform_point3a(grab_data.offset.translation);
+            let scale = scalar_scale(&pivot);
+            let hmd = &app.input_state.hmd;
+            // lying on the side: hmd up becomes up, as in realign
+            let up = if hmd.x_axis.dot(Vec3A::Y).abs() > 0.2 || hmd.z_axis.dot(Vec3A::Y).abs() > 0.9
             {
-                let cur_scale = overlay.config.default_state.transform.x_axis.length();
-                let tgt_scale = active_state.transform.x_axis.length();
-                let mat = &mut overlay.config.default_state.transform.matrix3;
-                *mat = mat.mul_scalar(tgt_scale / cur_scale);
-            }
-            overlay.config.pause_movement = false;
-            if let Some(overlay_state) = overlay.config.active_state.as_mut() {
-                window::save_transform(overlay_state, app);
+                hmd.y_axis
+            } else {
+                Vec3A::Y
+            };
+            if let Some(rotation) = face_about_pivot(
+                pivot.translation,
+                -grab_data.pivot * scale,
+                hmd.translation,
+                up,
+                app.session.config.snap_angle_deg,
+            ) {
+                pivot.matrix3 = rotation.mul_scalar(scale);
             }
         }
+        app.anchor = pivot * pivot_local.inverse();
+    } else {
+        // single grab resize
+        if pointer.now.any_click() {
+            pointer.interaction.mode = PointerMode::Special;
+            let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0) * 0.2 + 0.4;
+            handle_scale(
+                &mut overlay_state.transform,
+                pointer.now.scroll_y * grab_dist * scroll_factor,
+            );
+            handle_scale(
+                &mut grab_data.offset,
+                pointer.now.scroll_y * grab_dist * scroll_factor,
+            );
+        } else if app.session.config.allow_sliding && pointer.now.scroll_y.is_finite() {
+            // single grab push/pull
+            let grab_dist = grab_data.offset.translation.length().clamp(0.5, 5.0);
+            grab_data.offset.translation.z -=
+                pointer.now.scroll_y * scroll_factor * 0.02 * grab_dist;
+            grab_data.offset.translation.z = grab_data.offset.translation.z.min(-0.05);
+        }
+        if pointer.now.click_right || pointer.now.click_modifier_right {
+            overlay_state.transform = pointer.pose * grab_data.offset;
+        } else {
+            let scale = scalar_scale(&overlay_state.transform);
+            overlay_state.transform.translation =
+                pointer.pose.transform_point3a(grab_data.offset.translation);
+            realign(
+                &mut overlay_state.transform,
+                &app.input_state.hmd,
+                scale,
+                app.session.config.snap_angle_deg,
+            );
+        }
+        overlay.config.pause_movement = true;
+        overlay.config.dirty = true;
+    }
+}
 
+fn finish_grab<O>(
+    idx: usize,
+    overlay: Option<&mut OverlayWindowData<O>>,
+    app: &mut AppState,
+    reason: GrabEnd,
+) {
+    let pointer = &mut app.input_state.pointers[idx];
+    let Some(grab) = pointer.interaction.grabbed.take() else {
+        return;
+    };
+    pointer.interaction.grab_needs_release = reason != GrabEnd::Released;
+    let releasing_hand = pointer.hand();
+    let another_individual_grab = app.input_state.pointers.iter().any(|pointer| {
+        pointer
+            .interaction
+            .grabbed
+            .is_some_and(|other| other.grabbed_id == grab.grabbed_id && !other.grab_anchor)
+    });
+    if !grab.grab_anchor
+        && !another_individual_grab
+        && let Some(overlay) = overlay
+    {
+        if reason == GrabEnd::Released && &*overlay.config.name == WATCH_NAME {
+            // watch special: when dropped, follow the hand that wasn't grabbing
+            if let Some(overlay_state) = overlay.config.active_state.as_mut() {
+                let align_to_hmd = overlay_state.align_to_hmd;
+                overlay_state.positioning = match overlay_state.positioning {
+                    Positioning::FollowHand { hand, lerp } => match releasing_hand {
+                        Some(LeftRight::Left) => Positioning::FollowHand {
+                            hand: LeftRight::Right,
+                            lerp,
+                        },
+                        Some(LeftRight::Right) => Positioning::FollowHand {
+                            hand: LeftRight::Left,
+                            lerp,
+                        },
+                        _ => Positioning::FollowHand { hand, lerp },
+                    },
+                    x => x,
+                };
+                overlay_state.align_to_hmd = align_to_hmd;
+            }
+        } else if &*overlay.config.name != WATCH_NAME
+            && overlay.config.global
+            && let Some(active_state) = overlay.config.active_state.as_ref()
+        {
+            let cur_scale = overlay.config.default_state.transform.x_axis.length();
+            let tgt_scale = active_state.transform.x_axis.length();
+            let mat = &mut overlay.config.default_state.transform.matrix3;
+            *mat = mat.mul_scalar(tgt_scale / cur_scale);
+        }
+        overlay.config.pause_movement = false;
+        if let Some(overlay_state) = overlay.config.active_state.as_mut() {
+            window::save_transform(overlay_state, app);
+        }
+    }
+    crate::frame_shell::layout_changed();
+    if !app
+        .input_state
+        .pointers
+        .iter()
+        .any(|pointer| pointer.interaction.grabbed.is_some())
+    {
         // Hide anchor
         app.tasks.enqueue(TaskType::Overlay(OverlayTask::Modify(
             OverlaySelector::Name(ANCHOR_NAME.clone()),
@@ -1322,7 +1388,13 @@ where
                 o.deactivate();
             }),
         )));
-        log::debug!("Hand {}: dropped {}", idx, overlay.config.name);
+    }
+    if grab.grab_anchor {
+        log::info!("Hand {idx}: ended set anchor grab ({reason:?})");
+    } else if reason == GrabEnd::Released {
+        log::debug!("Hand {idx}: dropped {:?}", grab.grabbed_id);
+    } else {
+        log::info!("Hand {idx}: ended overlay grab ({reason:?})");
     }
 }
 
@@ -1345,4 +1417,51 @@ fn ray_test(
         local_pos,
         dist,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grab_ends_on_tracking_loss_or_pointer_source_change() {
+        let grab = GrabData::default();
+        let mut pointer = Pointer::new(0);
+        pointer.tracked = true;
+        pointer.now.grab = true;
+        assert_eq!(grab.end_reason(&pointer, true), None);
+        assert!(pointer.grab_started());
+
+        pointer.tracked = false;
+        assert_eq!(grab.end_reason(&pointer, true), Some(GrabEnd::TrackingLost));
+
+        // A tracked gaze pointer may take over the same slot without a gap.
+        pointer.tracked = true;
+        pointer.handsfree = true;
+        assert_eq!(grab.end_reason(&pointer, true), Some(GrabEnd::InputChanged));
+        pointer.interaction.grab_needs_release = true;
+        assert!(!pointer.grab_started());
+
+        pointer.handsfree = false;
+        assert_eq!(
+            grab.end_reason(&pointer, false),
+            Some(GrabEnd::OverlayUnavailable)
+        );
+
+        pointer.now.grab = false;
+        assert_eq!(grab.end_reason(&pointer, true), Some(GrabEnd::Released));
+    }
+
+    #[test]
+    fn individual_grab_keeps_the_other_hands_anchor_ownership() {
+        let mut input = InputState::new();
+        input.pointers[0].interaction.grabbed = Some(GrabData {
+            grab_anchor: true,
+            ..Default::default()
+        });
+        input.pointers[1].interaction.grabbed = Some(GrabData::default());
+        assert!(input.is_grabbing_anchor());
+        input.pointers[0].interaction.grabbed = None;
+        assert!(!input.is_grabbing_anchor());
+    }
 }

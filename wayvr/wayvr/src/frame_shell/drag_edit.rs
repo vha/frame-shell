@@ -118,7 +118,7 @@ pub fn begin<T: Default>(
     owner: u64,
 ) -> Result<(), String> {
     if app.panel_drag.is_some()
-        || app.anchor_grabbed
+        || app.input_state.is_grabbing_anchor()
         || app.input_state.is_grabbing_overlay(overlay)
     {
         return Err("Another panel grab is in progress.".into());

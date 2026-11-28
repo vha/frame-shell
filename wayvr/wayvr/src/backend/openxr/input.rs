@@ -699,10 +699,9 @@ impl OpenXrPointer {
         lerp_factor: Option<f32>,
     ) -> anyhow::Result<()> {
         let location = self.space.locate(&xr.stage, xr.predicted_display_time)?;
-        if location
-            .location_flags
-            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
-        {
+        let required_flags = xr::SpaceLocationFlags::ORIENTATION_VALID
+            | xr::SpaceLocationFlags::POSITION_VALID;
+        if location.location_flags.contains(required_flags) {
             let (cur_quat, cur_pos) = (Quat::from_affine3(&pointer.pose), pointer.pose.translation);
 
             let (new_quat, new_pos) = unsafe {
