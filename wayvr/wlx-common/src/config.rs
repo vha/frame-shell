@@ -468,7 +468,7 @@ pub struct GeneralConfig {
 	#[serde(default)]
 	pub space_gravity_floor_height: f32,
 
-	/// Estimate the floor height for 30 s after the shell starts
+	/// Estimate the floor height on startup when there is no saved calibration
 	#[serde(default = "def_true")]
 	pub floor_calibration_on_start: bool,
 

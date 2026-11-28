@@ -222,9 +222,7 @@ impl AppState {
             anchor: Affine3A::IDENTITY,
             floor_from_stage: Affine3A::IDENTITY,
             floor_from_raw: Affine3A::IDENTITY,
-            floor_calibration: crate::floor_estimate::FloorCalibration::new(
-                session.config.floor_calibration_on_start,
-            ),
+            floor_calibration: crate::floor_estimate::FloorCalibration::default(),
             panel_drag: None,
             wgui_theme: Rc::new(theme),
             wgui_globals: params.wgui_globals,

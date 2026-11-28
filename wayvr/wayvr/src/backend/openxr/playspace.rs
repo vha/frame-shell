@@ -75,8 +75,10 @@ impl PlayspaceMover {
                 self.save_center();
             }
             PlayspaceTask::ResetCenter => {
+                let mut calibration = Affine3A::IDENTITY;
+                calibration.translation.y = self.playspace_state.openxr_space_center.translation.y;
+                self.set_calibration(app, overlays, calibration);
                 app.floor_calibration.start(10);
-                self.set_calibration(app, overlays, Affine3A::IDENTITY);
             }
         }
     }
@@ -87,7 +89,15 @@ impl PlayspaceMover {
         app: &mut AppState,
     ) {
         if let Some(monado) = &mut app.monado_state {
+            let starting = !self.initialized;
             self.initialize(&mut monado.ipc);
+            if starting
+                && self.initialized
+                && !self.saved_calibration
+                && app.session.config.floor_calibration_on_start
+            {
+                app.floor_calibration.start(30);
+            }
         }
 
         self.update_floor_estimate(app, overlays);
@@ -327,11 +337,14 @@ impl PlayspaceMover {
         overlays: &mut OverlayWindowManager<OpenXrOverlayData>,
     ) {
         crate::floor_estimate::request(crate::frame_shell::floor_debug_visible(app));
-        let estimate = crate::floor_estimate::snapshot();
-        app.floor_calibration.update(&estimate);
         if !self.initialized || self.drag.is_some() || self.rotate.is_some() {
             return;
         }
+        let before = self.playspace_state.openxr_space_center * self.drag_offset;
+        let raw_head_height = app.input_state.hmd_position_valid.then(|| {
+            before.transform_point3a(app.input_state.hmd.translation).y
+        });
+        app.floor_calibration.update(&crate::floor_estimate::snapshot(), raw_head_height);
         let Some(height) = app.floor_calibration.height else {
             return;
         };
@@ -339,20 +352,14 @@ impl PlayspaceMover {
             return;
         };
         let mut calibration = self.playspace_state.openxr_space_center;
-        if (calibration.translation.y - height).abs() < 0.001 && !app.floor_calibration.needs_save {
-            return;
-        }
-        let before = calibration * self.drag_offset;
         calibration.translation.y = height;
         let after = calibration * self.drag_offset;
         if !apply_offset(after, &mut monado.ipc) {
             return;
         }
         self.playspace_state.openxr_space_center = calibration;
-        if app.floor_calibration.needs_save {
-            self.save_center();
-            app.floor_calibration.needs_save = false;
-        }
+        app.floor_calibration.stop();
+        self.save_center();
         if !app.session.config.space_drag_affects_world {
             playspace_common::shift_world(overlays, &mut app.anchor, &before, &after);
         }
@@ -437,6 +444,7 @@ impl PlayspaceMover {
             .input_state
             .pointers
             .iter()
+            .filter(|hand| hand.tracked && hand.position_tracked && !hand.handsfree)
             .map(|hand| {
                 self.drag_offset
                     .transform_point3a(hand.raw_pose.translation)
@@ -445,6 +453,7 @@ impl PlayspaceMover {
             .fold(f32::INFINITY, f32::min)
             - 0.05;
         if !floor.is_finite() {
+            crate::frame_shell::toast(app, "Floor unchanged. Place a tracked controller on the floor.".into());
             return;
         }
         calibration.translation.y += floor;

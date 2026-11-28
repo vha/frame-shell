@@ -63,8 +63,7 @@ pub fn request(wanted: bool) {
 }
 
 fn read() -> Option<FloorEstimate> {
-    let path =
-        std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("monado-floor");
+    let path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("monado-floor");
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let mut header = lines.next()?.split_whitespace();
@@ -98,6 +97,7 @@ fn read() -> Option<FloorEstimate> {
     Some(estimate)
 }
 
+#[derive(Default)]
 pub struct FloorCalibration {
     deadline: Option<Instant>,
     weighted_height: f64,
@@ -105,26 +105,9 @@ pub struct FloorCalibration {
     timestamp: u64,
     samples: u32,
     pub height: Option<f32>,
-    pub needs_save: bool,
 }
 
 impl FloorCalibration {
-    pub fn new(on_start: bool) -> Self {
-        let mut calibration = Self {
-            deadline: None,
-            weighted_height: 0.0,
-            weight: 0.0,
-            timestamp: 0,
-            samples: 0,
-            height: None,
-            needs_save: false,
-        };
-        if on_start {
-            calibration.start(30);
-        }
-        calibration
-    }
-
     pub fn start(&mut self, seconds: u64) {
         self.deadline = Some(Instant::now() + Duration::from_secs(seconds));
         log::info!("Collecting floor calibration for {seconds} seconds");
@@ -132,13 +115,12 @@ impl FloorCalibration {
         self.weighted_height = 0.0;
         self.weight = 0.0;
         self.timestamp = snapshot().timestamp;
-        self.needs_save = false;
+        self.height = None;
     }
 
     pub fn stop(&mut self) {
         self.deadline = None;
         self.height = None;
-        self.needs_save = false;
     }
 
     pub fn remaining_seconds(&self) -> Option<u32> {
@@ -150,19 +132,18 @@ impl FloorCalibration {
         })
     }
 
-    pub fn update(&mut self, estimate: &FloorEstimate) {
+    pub fn update(&mut self, estimate: &FloorEstimate, raw_head_height: Option<f32>) {
         let Some(deadline) = self.deadline else {
             return;
         };
         if Instant::now() >= deadline {
             self.deadline = None;
             crate::frame_shell::show_floor();
-            self.needs_save = self.weight > 0.0;
+            self.height = (self.samples >= 5).then(|| (self.weighted_height / self.weight) as f32);
             log::info!(
-                "Floor calibration finished: height {:?} m, {} estimates, saved={}",
+                "Floor calibration finished: height {:?} m, {} usable estimates",
                 self.height,
-                self.samples,
-                self.needs_save
+                self.samples
             );
             return;
         }
@@ -170,11 +151,65 @@ impl FloorCalibration {
             return;
         }
         self.timestamp = estimate.timestamp;
-        if let Some(height) = estimate.height.filter(|_| estimate.support >= 30) {
+        if let Some(height) = estimate.height.filter(|height| {
+            estimate.support >= 30
+                && raw_head_height.is_some_and(|head| (0.5..=2.9).contains(&(head - height)))
+        }) {
             self.samples += 1;
             self.weighted_height += f64::from(height) * estimate.support as f64;
             self.weight += estimate.support as f64;
-            self.height = Some((self.weighted_height / self.weight) as f32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_eye_mesh_does_not_replace_the_floor() {
+        let mut calibration = FloorCalibration {
+            deadline: Some(Instant::now() + Duration::from_secs(1)),
+            ..Default::default()
+        };
+        for timestamp in 1..=8 {
+            calibration.update(
+                &FloorEstimate {
+                    timestamp,
+                    height: Some(-1.147),
+                    support: 268,
+                    ..Default::default()
+                },
+                Some(-1.18),
+            );
+        }
+        calibration.deadline = Some(Instant::now());
+        calibration.update(&FloorEstimate::default(), Some(-1.18));
+        assert_eq!(calibration.height, None);
+    }
+
+    #[test]
+    fn floor_is_proposed_once_collection_finishes() {
+        let mut calibration = FloorCalibration {
+            deadline: Some(Instant::now() + Duration::from_secs(1)),
+            ..Default::default()
+        };
+        for timestamp in 1..=5 {
+            calibration.update(
+                &FloorEstimate {
+                    timestamp,
+                    height: Some(-2.0),
+                    support: 60,
+                    ..Default::default()
+                },
+                Some(-0.8),
+            );
+            assert_eq!(calibration.height, None);
+        }
+        calibration.deadline = Some(Instant::now());
+        calibration.update(&FloorEstimate::default(), Some(-0.8));
+        assert_eq!(calibration.height, Some(-2.0));
+        calibration.stop();
+        assert_eq!(calibration.height, None);
     }
 }

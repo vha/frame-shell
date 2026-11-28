@@ -78,6 +78,7 @@ pub enum FocusPickState {
 
 pub struct InputState {
     pub hmd: Affine3A,
+    pub(crate) hmd_position_valid: bool,
     /// Midpoint between the eyes, in head space
     pub eye_center: Vec3A,
     pub ipd: f32,
@@ -112,6 +113,7 @@ impl InputState {
     pub fn new() -> Self {
         Self {
             hmd: Affine3A::IDENTITY,
+            hmd_position_valid: false,
             eye_center: Vec3A::ZERO,
             ipd: 0.0,
             eye_gaze: None,
@@ -462,6 +464,7 @@ pub struct Pointer {
     pub pending_haptics: Option<Haptics>,
     pub(super) interaction: InteractionState,
     pub tracked: bool,
+    pub(crate) position_tracked: bool,
     pub handsfree: bool,
     /// distance of the most recent ray hit on a wayland client window, used for drag n drop
     pub last_wvr_hit_distance: Option<f32>,
@@ -483,6 +486,7 @@ impl Pointer {
             pending_haptics: None,
             interaction: InteractionState::default(),
             tracked: false,
+            position_tracked: false,
             handsfree: false,
             last_wvr_hit_distance: None,
         }

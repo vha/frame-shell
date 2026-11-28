@@ -134,7 +134,7 @@
 ## Space gravity: floor height (Y position where gravity stops)
 #space_gravity_floor_height: 0.0
 
-## Estimate the floor height for 30 s after the shell starts
+## Estimate the floor height on startup when there is no saved calibration
 #floor_calibration_on_start: true
 
 ## Space gravity: ground friction when touching the floor
